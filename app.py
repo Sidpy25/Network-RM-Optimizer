@@ -44,10 +44,11 @@ def read_upload(f) -> pd.DataFrame | None:
 
 
 @st.cache_data(show_spinner=False)
-def optimise(history, costs, fleet, constraints, cfg_dict, scenarios):
+def optimise(history, costs, fleet, constraints, new_routes, cfg_dict, scenarios):
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        res = run(history, costs, fleet, constraints, OptimizerConfig(**cfg_dict), scenarios=scenarios)
+        res = run(history, costs, fleet, constraints, OptimizerConfig(**cfg_dict), scenarios=scenarios,
+                  new_routes=new_routes)
     msgs = sorted({str(x.message) for x in w if not issubclass(x.category, DeprecationWarning)})
     return res, msgs
 
@@ -66,12 +67,17 @@ if source == "Sample network":
     frames = sample_frames()
     history, costs, fleet, constraints = (frames["history"], frames["costs"],
                                           frames["fleet"], frames["constraints"])
+    new_routes = frames["new_routes"] if st.sidebar.checkbox("Include 3 candidate new routes", True) else None
     st.sidebar.caption("Synthetic Indian domestic + Gulf network, 18 sectors, INR.")
 else:
     history = read_upload(st.sidebar.file_uploader("LY sector-month history *", ["csv", "xlsx"]))
     costs = read_upload(st.sidebar.file_uploader("New cost forecast *", ["csv", "xlsx"]))
     fleet = read_upload(st.sidebar.file_uploader("Fleet (optional)", ["csv", "xlsx"]))
     constraints = read_upload(st.sidebar.file_uploader("Sector constraints (optional)", ["csv", "xlsx"]))
+    new_routes = read_upload(st.sidebar.file_uploader(
+        "New routes not flown LY (optional)", ["csv", "xlsx"],
+        help="One row per candidate route: distance_km plus est_daily_pax + est_avg_fare, "
+             "or a proxy_sector to borrow demand/fare/seasonality from. See the template."))
     with st.sidebar.expander("Download input templates"):
         for k, df in sample_frames().items():
             st.download_button(f"{k}.csv", df.to_csv(index=False), f"{k}_template.csv", "text/csv",
@@ -110,6 +116,10 @@ with st.sidebar.expander("Network constraints"):
     min_wk = st.number_input("Min weekly frequency if operated", 1, 14, d.min_weekly_if_operated)
     max_mult = st.slider("Max frequency × LY", 1.0, 3.0, d.max_weekly_multiplier, 0.1)
     pair = st.checkbox("Same frequency both directions", d.pair_directions)
+    ramp_m = st.number_input("New route ramp-up months", 0, 24, d.new_route_ramp_months,
+                             help="Months for a new route to reach mature demand (per-route override in the file).")
+    ramp_s = st.slider("New route launch-month demand", 0.1, 1.0, d.new_route_ramp_start, 0.05,
+                       help="Share of mature demand in the launch month.")
     use_mkt = st.checkbox("Protect market presence")
     mkt_share = st.slider("Min share of LY ASK per market", 0.0, 1.0, 0.7, 0.05, disabled=not use_mkt)
 
@@ -122,6 +132,8 @@ if history is None or costs is None:
     st.stop()
 
 hist_markets = sorted(history["market"].dropna().astype(str).unique()) if "market" in history else ["NETWORK"]
+if new_routes is not None and "market" in new_routes:
+    hist_markets = sorted(set(hist_markets) | set(new_routes["market"].dropna().astype(str)))
 with st.expander("Market-level overrides (optional)"):
     st.caption("Blank = use the network-wide value from the sidebar. Growth and fare change in %.")
     mo = st.data_editor(
@@ -154,6 +166,7 @@ cfg = dict(
     market_frequency_elasticity=_overrides("frequency_elasticity"),
     variable_cost_share=var_share, fuel_share=fuel_share,
     min_weekly_if_operated=int(min_wk), max_weekly_multiplier=max_mult, pair_directions=pair,
+    new_route_ramp_months=int(ramp_m), new_route_ramp_start=ramp_s,
     fleet_headroom=headroom, market_min_ask_share=mkt_share if use_mkt else None,
     min_fleet_utilisation=min_util, atf_scenarios=atf,
 )
@@ -163,7 +176,7 @@ if st.sidebar.button("▶ Run optimiser", type="primary", width="stretch") or "r
     with st.spinner("Calibrating demand and solving the network…"):
         try:
             st.session_state.res, st.session_state.msgs = optimise(
-                history, costs, fleet, constraints, cfg, run_scen)
+                history, costs, fleet, constraints, new_routes, cfg, run_scen)
             st.session_state.cfg = cfg
         except Exception as e:  # show input / infeasibility problems to the user
             st.session_state.pop("res", None)
@@ -194,7 +207,7 @@ k[4].metric("RASK − CASK", f"{tot.rec_rask - tot.rec_cask:.3f}",
 st.caption("Deltas compare the recommendation with flying **last year's schedule at the new costs**. "
            f"LY actual net profit was {cr(tot.ly_net_profit)}.")
 
-tabs = st.tabs(["Network", "Markets", "Schedule", "Sector plan", "ATF scenarios", "Download"])
+tabs = st.tabs(["Network", "Markets", "Schedule", "Sector plan", "New routes", "ATF scenarios", "Download"])
 
 # ----------------------------------------------------------------- Network tab
 with tabs[0]:
@@ -299,9 +312,10 @@ with tabs[2]:
     g = plan[plan["market"].isin(mk)].copy()
     g["Month"] = g["month"].map(lambda m: MONTHS[m - 1])
     g["change"] = g["rec_weekly_freq"] - g["ly_weekly_freq"]
+    g["sector"] = g["sector"].where(~g["is_new"], g["sector"] + " (new)")
     lim = max(1.0, float(g["change"].abs().max() or 1))
     # Keep each A-B / B-A pair together within its market.
-    g["_pair"] = g["sector"].map(lambda x: "-".join(sorted(x.split("-"))))
+    g["_pair"] = g["sector"].str.replace(" (new)", "", regex=False).map(lambda x: "-".join(sorted(x.split("-"))))
     sector_order = g.sort_values(["market", "_pair", "sector"])["sector"].unique().tolist()
     base_enc = dict(x=alt.X("Month:N", sort=MONTHS, title=None, axis=alt.Axis(orient="top", labelAngle=0)),
                     y=alt.Y("sector:N", sort=sector_order, title=None))
@@ -325,7 +339,8 @@ with tabs[3]:
     f1, f2, f3, f4 = st.columns(4)
     fm = f1.multiselect("Market", hist_markets, key="plan_mkt")
     fmo = f2.multiselect("Month", list(range(1, 13)), format_func=lambda m: MONTHS[m - 1], key="plan_month")
-    fa = f3.multiselect("Action", ["ADD", "CUT", "MAINTAIN", "DROP"], key="plan_action")
+    fa = f3.multiselect("Action", ["ADD", "CUT", "MAINTAIN", "DROP", "LAUNCH", "NOT LAUNCHED"],
+                        key="plan_action")
     fs = f4.text_input("Sector contains", key="plan_sector")
     p = plan
     if fm:
@@ -377,8 +392,50 @@ with tabs[3]:
         "rec_net_profit": st.column_config.NumberColumn("Recommended ₹Cr", format="%.2f"),
         "rec_load_factor": st.column_config.NumberColumn("Rec LF", format="percent")})
 
-# ------------------------------------------------------------------- ATF tab
+# -------------------------------------------------------------- New routes tab
 with tabs[4]:
+    nrs = res.get("new_routes")
+    if nrs is None or nrs.empty:
+        st.info("No new routes in this run. Upload a new-routes file in the sidebar (template available) "
+                "to test routes not flown last year.")
+    else:
+        st.subheader("Should we launch these routes?")
+        st.caption("A route is launched only if the extra network contribution it earns (after the "
+                   "aircraft time it takes from other routes) covers its one-off launch cost. Demand ramps up "
+                   "over the first months. Launch cost sits on the listed direction.")
+        v = nrs.copy()
+        v["decision"] = v["decision"].map({"LAUNCH": "✅ LAUNCH", "NOT LAUNCHED": "⛔ NOT LAUNCHED"})
+        v["start_month"] = v["start_month"].map(lambda m: MONTHS[int(m) - 1])
+        for c in ["rec_revenue", "rec_total_cost", "rec_contribution", "launch_cost", "first_year_net_after_launch"]:
+            v[c] = v[c] / 1e7
+        st.dataframe(v.drop(columns=["rec_launch_cost", "rec_pax"]), hide_index=True, width="stretch",
+                     column_config={
+                         "market": "Market", "sector": "Sector", "decision": "Decision",
+                         "start_month": "Earliest start", "months_operated": "Months flown",
+                         "avg_weekly_when_flown": st.column_config.NumberColumn("Avg /wk when flown", format="%.1f"),
+                         "rec_revenue": st.column_config.NumberColumn("Revenue ₹Cr", format="%.2f"),
+                         "rec_total_cost": st.column_config.NumberColumn("Cost ₹Cr", format="%.2f"),
+                         "rec_contribution": st.column_config.NumberColumn("Contribution ₹Cr", format="%.2f"),
+                         "launch_cost": st.column_config.NumberColumn("Launch cost ₹Cr", format="%.2f"),
+                         "first_year_net_after_launch": st.column_config.NumberColumn(
+                             "Yr-1 contribution after launch ₹Cr", format="%.2f"),
+                         "load_factor": st.column_config.NumberColumn("LF", format="percent")})
+        nplan = plan[plan["is_new"] & (plan["rec_weekly_freq"] > 0)].copy()
+        nplan["Month"] = nplan["month"].map(lambda m: MONTHS[m - 1])
+        st.subheader("Monthly plan for launched routes")
+        st.dataframe(nplan[["Month", "sector", "action", "rec_weekly_freq", "schedule_pattern", "rec_load_factor",
+                            "rec_avg_fare", "rec_contribution", "rec_launch_cost"]],
+                     hide_index=True, width="stretch", column_config={
+                         "sector": "Sector", "action": "Action",
+                         "rec_weekly_freq": st.column_config.NumberColumn("Rec /wk", format="%.0f"),
+                         "schedule_pattern": "Pattern",
+                         "rec_load_factor": st.column_config.NumberColumn("LF", format="percent"),
+                         "rec_avg_fare": st.column_config.NumberColumn("Fare", format="%.0f"),
+                         "rec_contribution": st.column_config.NumberColumn("Contribution ₹", format="%.0f"),
+                         "rec_launch_cost": st.column_config.NumberColumn("Launch cost ₹", format="%.0f")})
+
+# ------------------------------------------------------------------- ATF tab
+with tabs[5]:
     if "atf_summary" not in res:
         st.info("Add ATF scenarios in the sidebar (Cost section) to see fuel-price sensitivity.")
     else:
@@ -406,7 +463,7 @@ with tabs[4]:
         st.dataframe(view, hide_index=True, width="stretch")
 
 # -------------------------------------------------------------- Download tab
-with tabs[5]:
+with tabs[6]:
     st.subheader("Export")
     st.download_button("⬇ Full results workbook (.xlsx)", to_excel_bytes(res), "network_plan.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")

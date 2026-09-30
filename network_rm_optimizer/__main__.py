@@ -3,7 +3,8 @@
     python -m network_rm_optimizer sample --out sample_data
     python -m network_rm_optimizer optimise --history sample_data/history_ly.csv \
         --costs sample_data/cost_forecast.csv --fleet sample_data/fleet.csv \
-        --constraints sample_data/constraints.csv --out results/network_plan.xlsx
+        --constraints sample_data/constraints.csv --new-routes sample_data/new_routes.csv \
+        --out results/network_plan.xlsx
 """
 from __future__ import annotations
 
@@ -36,6 +37,7 @@ def main(argv=None) -> int:
     o.add_argument("--costs", required=True, help="new cost estimate per sector-month (csv/xlsx)")
     o.add_argument("--fleet", help="fleet_type, aircraft, block_hours_per_day [, seats]")
     o.add_argument("--constraints", help="sector min/max/must-operate/fixed frequencies")
+    o.add_argument("--new-routes", help="candidate sectors not flown last year (csv/xlsx)")
     o.add_argument("--config", help="JSON file with OptimizerConfig overrides")
     o.add_argument("--objective", choices=["contribution", "profit"])
     o.add_argument("--target-year", type=int)
@@ -79,7 +81,8 @@ def main(argv=None) -> int:
         overrides["atf_scenarios"] = tuple(overrides["atf_scenarios"])
     cfg = OptimizerConfig(**overrides)
 
-    res = run(a.history, a.costs, a.fleet, a.constraints, cfg, scenarios=not a.no_scenarios)
+    res = run(a.history, a.costs, a.fleet, a.constraints, cfg, scenarios=not a.no_scenarios,
+              new_routes=a.new_routes)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     write_excel(res, a.out)
 
@@ -108,6 +111,14 @@ def main(argv=None) -> int:
         print(atf.assign(revenue=atf.revenue / 1e7, total_cost=atf.total_cost / 1e7, net_profit=atf.net_profit / 1e7)
               [["scenario", "sectors_months_operated", "revenue", "total_cost", "net_profit", "load_factor"]]
               .round(3).to_string(index=False))
+    if "new_routes" in res and len(res["new_routes"]):
+        nr = res["new_routes"]
+        print("\nNew routes:")
+        print(nr.assign(contribution_cr=nr.rec_contribution / 1e7, launch_cr=nr.launch_cost / 1e7,
+                        net_after_launch_cr=nr.first_year_net_after_launch / 1e7)
+              [["market", "sector", "decision", "start_month", "months_operated", "avg_weekly_when_flown",
+                "load_factor", "contribution_cr", "launch_cr", "net_after_launch_cr"]]
+              .round(2).to_string(index=False))
     sa = res["sector_annual"]
     print("\nSector plan (full-year average weekly frequency):")
     print(sa[["market", "sector", "ly_avg_weekly", "rec_avg_weekly", "months_operated"]]

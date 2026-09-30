@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 from .config import OptimizerConfig
-from .data import load_constraints, load_fleet, prepare_costs, prepare_history
+from .data import load_constraints, load_fleet, prepare_costs, prepare_history, prepare_new_routes
 from .demand import calibrate, evaluate, frequency_options
 from .optimizer import fleet_capacity, optimise
 
@@ -15,7 +15,7 @@ METRICS = ["departures", "seats", "ask", "pax", "revenue", "variable_cost", "tot
 # departure x departures). "net_profit" = contribution - fixed cost pool, where
 # the fixed pool (ownership, overheads) is carried whatever is flown - this is
 # the true network bottom line in the planning year.
-SUM_METRICS = METRICS + ["net_profit", "fixed_cost_pool"]
+SUM_METRICS = METRICS + ["net_profit", "fixed_cost_pool", "launch_cost"]
 
 
 def schedule_pattern(weekly: float) -> str:
@@ -31,7 +31,9 @@ def schedule_pattern(weekly: float) -> str:
     return " + ".join(parts)
 
 
-def _action(ly: float, rec: float) -> str:
+def _action(ly: float, rec: float, is_new: bool = False) -> str:
+    if is_new:
+        return "LAUNCH" if rec > 0 else "NOT LAUNCHED"
     if rec == 0 and ly > 0:
         return "DROP"
     if rec > ly + 0.5:
@@ -72,7 +74,7 @@ def summarise(plan: pd.DataFrame, by: list[str]) -> pd.DataFrame:
                   "ly_total_cost", "base_total_cost", "rec_total_cost",
                   "base_contribution", "rec_contribution", "contribution_uplift_vs_base",
                   "ly_net_profit", "base_net_profit", "rec_net_profit", "net_profit_uplift_vs_base",
-                  "base_profit", "rec_profit",
+                  "rec_launch_cost", "base_profit", "rec_profit",
                   "ly_ask", "rec_ask", "ask_change_vs_ly_pct",
                   "ly_load_factor", "base_load_factor", "rec_load_factor",
                   "ly_rask", "base_rask", "rec_rask", "ly_cask", "base_cask", "rec_cask",
@@ -93,13 +95,20 @@ def build_plan(base: pd.DataFrame, chosen: pd.DataFrame, config: OptimizerConfig
     plan["base_fixed_cost_pool"] = plan["rec_fixed_cost_pool"] = (
         (1 - plan["variable_cost_share"]) * plan["new_cost_per_departure"] * plan["ly_departures"])
     plan["base_net_profit"] = plan["base_contribution"] - plan["base_fixed_cost_pool"]
-    plan["rec_net_profit"] = plan["rec_contribution"] - plan["rec_fixed_cost_pool"]
+    # One-off launch cost, booked in a new route's first operated month.
+    plan["base_launch_cost"] = 0.0
+    plan["rec_launch_cost"] = 0.0
+    flown = plan[(plan["launch_cost"] > 0) & (plan["rec_weekly_freq"] > 0)]
+    first = flown.sort_values("month").groupby("sector").head(1).index
+    plan.loc[first, "rec_launch_cost"] = plan.loc[first, "launch_cost"]
+    plan["rec_net_profit"] = plan["rec_contribution"] - plan["rec_fixed_cost_pool"] - plan["rec_launch_cost"]
     plan = _ratios(plan.rename(columns={"ly_avg_fare": "_f", "ly_load_factor": "_lf"}), "rec_")
     plan = plan.rename(columns={"_f": "ly_avg_fare", "_lf": "ly_load_factor"})
 
     plan["rec_daily_freq"] = plan["rec_weekly_freq"] / 7
     plan["schedule_pattern"] = plan["rec_weekly_freq"].map(schedule_pattern)
-    plan["action"] = [_action(a, b) for a, b in zip(plan["ly_weekly_freq"], plan["rec_weekly_freq"])]
+    plan["action"] = [_action(a, b, n) for a, b, n in
+                      zip(plan["ly_weekly_freq"], plan["rec_weekly_freq"], plan["is_new"])]
     seat_rev = plan["rec_avg_fare"] * plan["rec_seats"]
     plan["breakeven_lf_full_cost"] = np.where(seat_rev > 0, plan["rec_total_cost"] / seat_rev, np.nan)
     plan["breakeven_lf_variable"] = np.where(seat_rev > 0, plan["rec_variable_cost"] / seat_rev, np.nan)
@@ -122,7 +131,7 @@ def build_plan(base: pd.DataFrame, chosen: pd.DataFrame, config: OptimizerConfig
 
 
 PLAN_COLUMNS = [
-    "month", "market", "sector", "fleet_type", "action", "at_max_frequency",
+    "month", "market", "sector", "fleet_type", "is_new", "action", "at_max_frequency",
     "ly_weekly_freq", "rec_weekly_freq", "rec_daily_freq", "schedule_pattern",
     "ly_load_factor", "rec_load_factor", "ly_avg_fare", "rec_avg_fare",
     "ly_rask", "rec_rask", "ly_cask", "new_cask", "cost_change_pct",
@@ -132,7 +141,7 @@ PLAN_COLUMNS = [
     "base_net_profit", "rec_net_profit", "net_profit_uplift_vs_base",
     "base_profit", "rec_profit",
     "breakeven_lf_full_cost", "breakeven_lf_variable",
-    "ly_spill_pax", "rec_pax", "rec_ask", "rec_block_hours",
+    "rec_launch_cost", "ly_spill_pax", "rec_pax", "rec_ask", "rec_block_hours",
 ]
 
 
@@ -145,6 +154,31 @@ def sector_annual(plan: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
     return s.sort_values(f"rec_{config.objective}", ascending=False)
 
 
+def new_route_summary(plan: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
+    """One row per new sector: launch decision and first-year economics."""
+    n = plan[plan["is_new"]]
+    if n.empty:
+        return pd.DataFrame()
+    op = n[n["rec_weekly_freq"] > 0]
+    g = n.groupby(["market", "sector"]).agg(
+        start_month=("start_month", "first"),
+        months_operated=("rec_weekly_freq", lambda v: int((v > 0).sum())),
+        launch_cost=("launch_cost", "max"),
+        rec_revenue=("rec_revenue", "sum"), rec_total_cost=("rec_total_cost", "sum"),
+        rec_contribution=("rec_contribution", "sum"), rec_launch_cost=("rec_launch_cost", "sum"),
+        rec_pax=("rec_pax", "sum"), rec_seats=("rec_seats", "sum"),
+    ).reset_index()
+    avg = op.groupby("sector")["rec_weekly_freq"].mean()
+    g["avg_weekly_when_flown"] = g["sector"].map(avg).fillna(0.0)
+    g["decision"] = np.where(g["months_operated"] > 0, "LAUNCH", "NOT LAUNCHED")
+    g["load_factor"] = np.where(g["rec_seats"] > 0, g["rec_pax"] / g["rec_seats"].where(g["rec_seats"] > 0), np.nan)
+    g["first_year_net_after_launch"] = g["rec_contribution"] - g["rec_launch_cost"]
+    return g[["market", "sector", "decision", "start_month", "months_operated", "avg_weekly_when_flown",
+              "rec_revenue", "rec_total_cost", "rec_contribution", "launch_cost", "rec_launch_cost",
+              "first_year_net_after_launch", "load_factor", "rec_pax"]].sort_values(
+        "first_year_net_after_launch", ascending=False)
+
+
 def run_scenarios(base, config, fleet, cons) -> tuple[pd.DataFrame, pd.DataFrame]:
     freqs, totals = {}, []
     for mult in config.atf_scenarios:
@@ -154,7 +188,8 @@ def run_scenarios(base, config, fleet, cons) -> tuple[pd.DataFrame, pd.DataFrame
         tot = ch[["revenue", "total_cost", "contribution", "profit", "ask", "pax", "seats"]].sum()
         cpd = base["new_cost_per_departure"] * (1 + base["fuel_share"] * (mult - 1))
         fixed = ((1 - base["variable_cost_share"]) * cpd * base["ly_departures"]).sum()
-        tot["net_profit"] = tot["contribution"] - fixed
+        launched = ch.loc[ch["weekly_freq"] > 0, ["sector", "launch_cost"]].drop_duplicates("sector")
+        tot["net_profit"] = tot["contribution"] - fixed - launched["launch_cost"].sum()
         # Also: what if we flew the base-case plan but ATF moved?
         totals.append({"scenario": label, "atf_multiplier": mult,
                        "sectors_months_operated": int((ch["weekly_freq"] > 0).sum()),
@@ -174,13 +209,16 @@ def run_scenarios(base, config, fleet, cons) -> tuple[pd.DataFrame, pd.DataFrame
 
 
 def run(history, cost_forecast, fleet=None, constraints=None,
-        config: OptimizerConfig | None = None, scenarios: bool = True) -> dict[str, pd.DataFrame]:
+        config: OptimizerConfig | None = None, scenarios: bool = True,
+        new_routes=None) -> dict[str, pd.DataFrame]:
     config = config or OptimizerConfig()
     config.validate()
     fleet_df = load_fleet(fleet)
-    base = prepare_history(history, config, fleet_df)
+    base = calibrate(prepare_history(history, config, fleet_df), config)
+    if new_routes is not None:
+        nr = prepare_new_routes(new_routes, base, config, fleet_df)
+        base = calibrate(pd.concat([base, nr], ignore_index=True), config)
     base = prepare_costs(cost_forecast, base, config)
-    base = calibrate(base, config)
     cons = load_constraints(constraints)
 
     chosen = optimise(base, config, fleet_df, cons)
@@ -202,6 +240,8 @@ def run(history, cost_forecast, fleet=None, constraints=None,
                      + [c for c in plan.columns if c.startswith("marginal_")]],
         "fleet_utilisation": fleet_use,
     }
+    if base["is_new"].any():
+        out["new_routes"] = new_route_summary(plan, config)
     if scenarios and config.atf_scenarios:
         out["atf_frequencies"], out["atf_summary"] = run_scenarios(base, config, fleet_df, cons)
     out["assumptions"] = pd.DataFrame(

@@ -12,6 +12,11 @@ Calibration (per sector-month, from last year):
 At f = f_LY with zero growth the model reproduces LY pax, fare and revenue
 exactly, so any change it recommends comes from the new costs and the
 frequency trade-offs, not a calibration error.
+
+The model scales from reference columns (ref_weekly_freq, ref_seats,
+ref_demand, ref_fare). For existing sectors these are last year's values; for
+new routes they come from the new_routes file (own estimate or a proxy sector),
+and a ramp-up factor reduces demand in the first months after launch.
 """
 from __future__ import annotations
 
@@ -59,11 +64,24 @@ def unconstrain_demand(pax, capacity, cv, max_lf: float = 0.995):
 
 
 def calibrate(base: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
-    """Add unconstrained LY demand and planning-year growth factors."""
+    """Set reference demand/fare for existing sectors and planning-year growth factors."""
     b = base.copy()
-    b["ly_demand"] = unconstrain_demand(b["ly_pax"], b["ly_seats"], config.demand_cv)
-    b["ly_spill_pax"] = b["ly_demand"] - b["ly_pax"]
+    b["is_new"] = b["is_new"].fillna(False).astype(bool)
+    old = ~b["is_new"]
+    for c in ("ref_weekly_freq", "ref_seats", "ref_demand", "ref_fare", "ly_spill_pax"):
+        if c not in b.columns:
+            b[c] = np.nan
+    if "growth_applies" not in b.columns:
+        b["growth_applies"] = True
+    b["growth_applies"] = b["growth_applies"].fillna(True).astype(bool)
+    demand = unconstrain_demand(b.loc[old, "ly_pax"], b.loc[old, "ly_seats"], config.demand_cv)
+    b.loc[old, "ref_demand"] = demand
+    b.loc[old, "ly_spill_pax"] = demand - b.loc[old, "ly_pax"]
+    b.loc[old, "ref_weekly_freq"] = b.loc[old, "ly_weekly_freq"]
+    b.loc[old, "ref_seats"] = b.loc[old, "ly_seats"]
+    b.loc[old, "ref_fare"] = b.loc[old, "ly_avg_fare"]
     b["demand_growth"] = b["market"].map(config.market_demand_growth).fillna(config.demand_growth)
+    b.loc[~b["growth_applies"], "demand_growth"] = 0.0
     b["fare_growth"] = b["market"].map(config.market_fare_growth).fillna(config.fare_growth)
     b["frequency_elasticity"] = (b["market"].map(config.market_frequency_elasticity)
                                  .fillna(config.frequency_elasticity))
@@ -76,14 +94,15 @@ def evaluate(rows: pd.DataFrame, weekly, config: OptimizerConfig, cost_multiplie
     weekly = np.asarray(weekly, dtype=float)
     deps = weekly * r["days_in_month"].to_numpy() / 7.0
     seats = deps * r["seats_per_flight"].to_numpy()
-    f0 = r["ly_weekly_freq"].to_numpy()
-    s0 = r["ly_seats"].to_numpy()
+    f0 = r["ref_weekly_freq"].to_numpy()
+    s0 = r["ref_seats"].to_numpy()
 
     ratio_f = np.divide(weekly, f0, out=np.zeros_like(weekly), where=f0 > 0)
     ratio_s = np.divide(seats, s0, out=np.zeros_like(weekly), where=s0 > 0)
     with np.errstate(divide="ignore"):
-        mu = r["ly_demand"].to_numpy() * (1 + r["demand_growth"].to_numpy()) * np.power(ratio_f, r["frequency_elasticity"].to_numpy())
-        fare = r["ly_avg_fare"].to_numpy() * (1 + r["fare_growth"].to_numpy()) * np.where(
+        mu = (r["ref_demand"].to_numpy() * r["ramp"].to_numpy() * (1 + r["demand_growth"].to_numpy())
+              * np.power(ratio_f, r["frequency_elasticity"].to_numpy()))
+        fare = r["ref_fare"].to_numpy() * (1 + r["fare_growth"].to_numpy()) * np.where(
             ratio_s > 0, np.power(np.where(ratio_s > 0, ratio_s, 1.0), -config.fare_capacity_elasticity), 0.0)
     pax = expected_sales(mu, config.demand_cv, seats)
     revenue = pax * fare
@@ -117,8 +136,12 @@ def evaluate(rows: pd.DataFrame, weekly, config: OptimizerConfig, cost_multiplie
 
 def frequency_options(row: pd.Series, config: OptimizerConfig, cons: pd.DataFrame | None) -> list[int]:
     """Candidate weekly frequencies for one sector-month."""
-    f0 = row["ly_weekly_freq"]
+    if row["month"] < row["start_month"]:
+        return [0]  # new route not yet launched
+    f0 = row["ref_weekly_freq"]
     hi = int(min(config.max_weekly_cap, max(math.ceil(f0 * config.max_weekly_multiplier), math.ceil(f0) + 7)))
+    if pd.notna(row.get("max_weekly_override", np.nan)):
+        hi = int(row["max_weekly_override"])
     lo = config.min_weekly_if_operated
     must, fixed = False, None
     if cons is not None:
@@ -150,5 +173,5 @@ def build_options(base: pd.DataFrame, config: OptimizerConfig, cons: pd.DataFram
             freqs.append(f)
     rows = base.loc[idx]
     res = evaluate(rows, freqs, config, cost_multiplier)
-    keys = rows[["sector", "month", "market", "fleet_type"]]
+    keys = rows[["sector", "month", "market", "fleet_type", "is_new", "launch_cost"]]
     return pd.concat([keys, res], axis=1).reset_index().rename(columns={"index": "base_idx"})

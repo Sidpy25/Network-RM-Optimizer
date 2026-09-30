@@ -62,6 +62,12 @@ class OptimizerConfig:
     # Force A-B and B-A to run the same weekly frequency.
     pair_directions: bool = True
 
+    # --- New routes ----------------------------------------------------------
+    # Demand in launch month = ramp_start x mature demand, rising linearly to
+    # 100% after ramp_months (overridable per route in the new_routes file).
+    new_route_ramp_months: int = 6
+    new_route_ramp_start: float = 0.6
+
     # --- Network constraints ------------------------------------------------
     # Without a fleet file, block hours per fleet type per month are capped at
     # last year's block hours * (1 + fleet_headroom).

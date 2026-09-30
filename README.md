@@ -23,6 +23,7 @@ python -m network_rm_optimizer optimise \
     --costs sample_data/cost_forecast.csv \
     --fleet sample_data/fleet.csv \
     --constraints sample_data/constraints.csv \
+    --new-routes sample_data/new_routes.csv \
     --out results/network_plan.xlsx
 ```
 
@@ -45,6 +46,7 @@ cost files (CSV/Excel; templates can be downloaded from the sidebar), then:
 | Markets | Full-year net profit by market (LY schedule vs recommended) and market KPIs |
 | Schedule | Sector × month heatmap: recommended weekly frequency, coloured by change vs LY |
 | Sector plan | Filterable sector-month plan with actions, LF, fare, break-even LF and ±1/wk marginal value |
+| New routes | Launch / not-launch decision per candidate route, first-year economics, monthly plan |
 | ATF scenarios | Network net profit per fuel scenario and which decisions change with ATF |
 | Download | Full Excel workbook, plan CSV, assumptions used |
 
@@ -69,6 +71,7 @@ write_excel(res, "network_plan.xlsx")
 | **cost_forecast** (new year) | `month`, `sector`, and one of `cost_per_departure` / `cask` / `total_cost` + `planned_departures` | `fuel_share`, `variable_cost_share` per sector |
 | **fleet** | `fleet_type`, `aircraft`, `block_hours_per_day` | `seats` |
 | **constraints** | `sector` | `month`, `min_weekly`, `max_weekly`, `fixed_weekly`, `must_operate` |
+| **new_routes** (routes not flown LY) | `sector` (or `origin`+`destination`), `distance_km`, and either `est_daily_pax` + `est_avg_fare` **or** `proxy_sector` | `market`, `fleet_type`, `seats_per_flight`, `block_hours`, `ref_weekly` (7), `demand_scale`, `fare_scale`, `start_month`, `ramp_months`, `ramp_start`, `launch_cost`, `max_weekly`, `both_directions` (1) |
 
 Without a fleet file, each month may use at most last year's block hours
 (`fleet_headroom` loosens this).
@@ -101,6 +104,37 @@ Without a fleet file, each month may use at most last year's block hours
    STABLE / ATF-SENSITIVE / AT RISK, so you know which decisions hold whatever
    fuel does.
 
+### New routes (not flown last year)
+List candidate routes in `new_routes.csv`. The model builds the same demand/fare
+curve for them as for existing sectors, from one of two sources:
+
+* **Your own estimate**: `est_daily_pax` is the average daily demand you expect
+  at `ref_weekly` frequencies (default 7, i.e. daily), and `est_avg_fare` is the
+  expected average fare. Seasonality comes from the route's `market` (existing
+  sectors in that market), or is flat for a brand-new market. No growth factor is
+  applied, because the estimate is already in planning-year terms.
+* **A proxy sector**: `proxy_sector` is an existing sector with similar demand.
+  The new route borrows its unconstrained demand (× `demand_scale`), its
+  seasonality and its fare, scaled by (distance / proxy distance)^0.5 × `fare_scale`
+  unless `est_avg_fare` is given. Market growth applies.
+
+Then:
+* The **return direction** is added automatically (`both_directions=1`).
+* **Ramp-up**: demand is `ramp_start` (default 60%) of mature demand in the launch
+  month, rising linearly to 100% after `ramp_months` (default 6).
+  `start_month` is the earliest launch month.
+* **Costs**: put new routes in the cost forecast like any sector. If they're
+  missing, cost is estimated from the network's CASK vs stage-length curve for
+  that month, and a warning is shown.
+* **Launch decision**: a route is launched only if its extra *network*
+  contribution covers its one-off `launch_cost`. This is tested by re-solving the
+  months it flies without it, so aircraft moved onto the new route are charged
+  at what they would have earned elsewhere. Launch cost is booked in the first
+  month flown and deducted from net profit.
+* Outputs: a `new_routes` sheet and dashboard tab with the LAUNCH / NOT LAUNCHED
+  decision, months flown, average frequency, LF, revenue, contribution and
+  first-year result after launch cost. The plan shows `LAUNCH` actions.
+
 ### Objectives
 * `contribution` (default) = revenue − variable cost. Fixed costs are sunk in
   the planning year, so this also maximises **network net profit**
@@ -118,6 +152,7 @@ Without a fleet file, each month may use at most last year's block hours
 | `sector_annual` | Per sector: annual P&L, LY vs recommended average weekly frequency, months operated |
 | `plan` | Per sector-month: action (ADD/CUT/MAINTAIN/DROP), weekly and daily frequency, pattern ("2x daily + 3/wk"), LF, fare, RASK/CASK, cost change, contribution and net profit uplift, break-even LF, spilled pax, **marginal value of ±1 weekly frequency**, `at_max_frequency` flag |
 | `fleet_utilisation` | Block hours available vs LY vs recommended |
+| `new_routes` | Launch decision and first-year economics per new sector (when a new-routes file is given) |
 | `atf_frequencies`, `atf_summary` | Frequencies and network P&L under each ATF scenario, plus the robustness tag |
 | `assumptions` | Every parameter used |
 
@@ -139,8 +174,11 @@ Without a fleet file, each month may use at most last year's block hours
 `min_fleet_utilisation`, `market_min_ask_share`, `atf_scenarios`.
 
 ## Limitations / next steps
-* Sectors that were not flown last year have no history to calibrate on. Add
-  them with proxy data from a similar route.
+* New-route demand is only as good as your estimate or proxy. Run a range
+  (e.g. `demand_scale` 0.6 / 0.8 / 1.0) before committing.
+* Launch decisions are tested one route at a time (the worst one is dropped and
+  the rest re-tested). This is exact for independent routes, but approximate
+  when several new routes compete for the same aircraft.
 * No connecting-traffic (O&D) effects. Each sector is valued on local revenue.
 * No competitor response beyond what the elasticities capture.
 * Frequencies are chosen per month. Add smoothing constraints if schedule

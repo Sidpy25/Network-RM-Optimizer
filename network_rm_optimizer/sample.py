@@ -74,15 +74,35 @@ def generate(out_dir: str, ly_year: int = 2025, seed: int = 7) -> dict[str, str]
         {"sector": "CCU-IXB", "min_weekly": 3, "must_operate": 1, "note": "Regional connectivity commitment"},
         {"sector": "IXB-CCU", "min_weekly": 3, "must_operate": 1, "note": "Regional connectivity commitment"},
     ])
+    # Candidate routes not flown last year.
+    new_routes = pd.DataFrame([
+        {"sector": "BLR-DXB", "market": "Gulf", "distance_km": 2700, "block_hours": 4.1,
+         "proxy_sector": "BOM-DXB", "demand_scale": 0.75, "start_month": 4, "launch_cost": 3.0e7,
+         "note": "Proxy BOM-DXB demand x0.75; fare scaled by distance"},
+        {"sector": "DEL-IXB", "market": "Regional", "distance_km": 1250, "block_hours": 2.2,
+         "est_daily_pax": 260, "est_avg_fare": 5600, "ref_weekly": 7, "launch_cost": 1.5e7,
+         "note": "Own estimate: 260 pax/day at 1x daily; Regional seasonality"},
+        {"sector": "HYD-GOI", "market": "Leisure", "distance_km": 580, "block_hours": 1.3,
+         "proxy_sector": "BOM-GOI", "demand_scale": 0.45, "fare_scale": 0.95, "launch_cost": 1.0e7,
+         "note": "Weak proxy - expect NOT LAUNCHED"},
+    ])
+    # Cost estimates for two of the new routes (HYD-GOI is left out on purpose to
+    # show the stage-length cost fallback).
+    for sector, dist in (("BLR-DXB", 2700), ("DXB-BLR", 2700), ("DEL-IXB", 1250), ("IXB-DEL", 1250)):
+        for m in range(1, 13):
+            cpd = (3.3 + 900 / dist) * SEATS * dist * (1 + 0.40 * ATF_CHANGE[m - 1]) * 1.03
+            cost.append({"month": m, "sector": sector, "cost_per_departure": round(cpd), "fuel_share": 0.40})
     os.makedirs(out_dir, exist_ok=True)
     paths = {
         "history": os.path.join(out_dir, "history_ly.csv"),
         "costs": os.path.join(out_dir, "cost_forecast.csv"),
         "fleet": os.path.join(out_dir, "fleet.csv"),
         "constraints": os.path.join(out_dir, "constraints.csv"),
+        "new_routes": os.path.join(out_dir, "new_routes.csv"),
     }
     h.to_csv(paths["history"], index=False)
     pd.DataFrame(cost).to_csv(paths["costs"], index=False)
     fleet.to_csv(paths["fleet"], index=False)
     cons.to_csv(paths["constraints"], index=False)
+    new_routes.to_csv(paths["new_routes"], index=False)
     return paths

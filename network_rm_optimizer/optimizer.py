@@ -6,7 +6,9 @@ network contribution (or net profit), subject to:
     so paid-for aircraft are redeployed rather than grounded),
   * A-B / B-A running the same frequency (optional),
   * sector min / max / must-operate / fixed frequencies,
-  * a minimum share of last year's ASK per market (optional).
+  * a minimum share of last year's ASK per market (optional),
+  * new routes launched only if they earn back their one-off launch cost
+    (see optimise).
 The revenue curve is non-linear in frequency, so each candidate frequency is
 pre-computed (see demand.build_options) and the MILP chooses between them.
 """
@@ -24,8 +26,8 @@ from .demand import build_options
 
 
 @dataclass
-class MonthResult:
-    month: int
+class SolveResult:
+    months: list
     status: str
     objective: float
     chosen: pd.DataFrame
@@ -43,74 +45,120 @@ def fleet_capacity(base: pd.DataFrame, fleet: pd.DataFrame | None, config: Optim
     return cap[["month", "fleet_type", "block_hours_available"]]
 
 
-def solve_month(*args, **kwargs) -> MonthResult:
+def solve_block(*args, **kwargs) -> SolveResult:
     with warnings.catch_warnings():  # PuLP 3.x warns about its own 4.0 API changes
         warnings.simplefilter("ignore", DeprecationWarning)
-        return _solve_month(*args, **kwargs)
+        return _solve_block(*args, **kwargs)
 
 
-def _solve_month(opts: pd.DataFrame, base_m: pd.DataFrame, cap_m: pd.DataFrame,
-                config: OptimizerConfig) -> MonthResult:
-    month = int(base_m["month"].iloc[0])
-    prob = pulp.LpProblem(f"network_m{month}", pulp.LpMaximize)
+def _solve_block(opts: pd.DataFrame, base_b: pd.DataFrame, cap_b: pd.DataFrame,
+                 config: OptimizerConfig) -> SolveResult:
+    """Solve one or more months in a single model."""
+    months = sorted(base_b["month"].unique())
+    prob = pulp.LpProblem("network_" + "_".join(map(str, months)), pulp.LpMaximize)
     x = {i: pulp.LpVariable(f"x_{i}", cat="Binary") for i in opts.index}
-    obj_col = config.objective
+    prob += pulp.lpSum(opts.at[i, config.objective] * x[i] for i in opts.index)
 
-    prob += pulp.lpSum(opts.at[i, obj_col] * x[i] for i in opts.index)
-
-    for _, grp in opts.groupby("sector"):
+    for _, grp in opts.groupby(["sector", "month"]):
         prob += pulp.lpSum(x[i] for i in grp.index) == 1
 
-    for _, c in cap_m.iterrows():
-        g = opts[opts["fleet_type"] == c["fleet_type"]]
+    for _, c in cap_b.iterrows():
+        g = opts[(opts["fleet_type"] == c["fleet_type"]) & (opts["month"] == c["month"])]
         if len(g):
             bh = pulp.lpSum(g.at[i, "block_hours"] * x[i] for i in g.index)
-            prob += bh <= c["block_hours_available"], f"fleet_{c['fleet_type']}"
+            tag = f"{c['fleet_type']}_{c['month']}"
+            prob += bh <= c["block_hours_available"], f"fleet_{tag}"
             if config.min_fleet_utilisation > 0:
                 # Never demand more than the options can physically absorb.
                 max_bh = g.groupby("sector")["block_hours"].max().sum()
                 floor = min(config.min_fleet_utilisation * c["block_hours_available"], 0.999 * max_bh)
-                prob += bh >= floor, f"fleet_min_{c['fleet_type']}"
+                prob += bh >= floor, f"fleet_min_{tag}"
 
-    if config.pair_directions:
-        sectors = set(opts["sector"])
-        done = set()
-        for s in sectors:
-            r = reverse_sector(s)
-            if r in sectors and r != s and (r, s) not in done:
-                done.add((s, r))
-                a, b = opts[opts["sector"] == s], opts[opts["sector"] == r]
-                prob += (pulp.lpSum(a.at[i, "weekly_freq"] * x[i] for i in a.index)
-                         == pulp.lpSum(b.at[i, "weekly_freq"] * x[i] for i in b.index)), f"pair_{s}"
+    for m in months:
+        om = opts[opts["month"] == m]
+        if config.pair_directions:
+            sectors = set(om["sector"])
+            done = set()
+            for s in sectors:
+                r = reverse_sector(s)
+                if r in sectors and r != s and (r, s) not in done:
+                    done.add((s, r))
+                    a, b = om[om["sector"] == s], om[om["sector"] == r]
+                    prob += (pulp.lpSum(a.at[i, "weekly_freq"] * x[i] for i in a.index)
+                             == pulp.lpSum(b.at[i, "weekly_freq"] * x[i] for i in b.index)), f"pair_{s}_{m}"
 
-    if config.market_min_ask_share is not None:
-        ly_ask = base_m.groupby("market")["ly_ask"].sum()
-        for mkt, g in opts.groupby("market"):
-            prob += (pulp.lpSum(g.at[i, "ask"] * x[i] for i in g.index)
-                     >= config.market_min_ask_share * ly_ask[mkt]), f"mkt_{mkt}"
+        if config.market_min_ask_share is not None:
+            bm = base_b[base_b["month"] == m]
+            ly_ask = bm.groupby("market")["ly_ask"].sum()
+            for mkt, g in om.groupby("market"):
+                if ly_ask.get(mkt, 0) > 0:
+                    prob += (pulp.lpSum(g.at[i, "ask"] * x[i] for i in g.index)
+                             >= config.market_min_ask_share * ly_ask[mkt]), f"mkt_{mkt}_{m}"
 
     prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=config.solver_time_limit))
     status = pulp.LpStatus[prob.status]
-    if status not in ("Optimal",):
+    if status != "Optimal":
         raise RuntimeError(
-            f"Month {month}: solver status '{status}'. Constraints are probably inconsistent "
+            f"Month(s) {months}: solver status '{status}'. Constraints are probably inconsistent "
             "(e.g. must-operate frequencies need more block hours than the fleet has)."
         )
     chosen_idx = [i for i in opts.index if x[i].value() is not None and x[i].value() > 0.5]
-    return MonthResult(month, status, pulp.value(prob.objective), opts.loc[chosen_idx])
+    return SolveResult(months, status, pulp.value(prob.objective), opts.loc[chosen_idx])
+
+
+def _route_key(sector: str) -> str:
+    return "-".join(sorted(sector.split("-")))
+
+
+def _solve_months(opts, base, cap, config, months, forbid: frozenset) -> tuple[pd.DataFrame, dict]:
+    """Solve each month independently; routes in `forbid` may only take frequency 0."""
+    chosen, obj = [], {}
+    if forbid:
+        keys = opts["sector"].map(_route_key)
+        opts = opts[~(keys.isin(forbid) & (opts["weekly_freq"] > 0))]
+    for m in months:
+        res = solve_block(opts[opts["month"] == m], base[base["month"] == m], cap[cap["month"] == m], config)
+        chosen.append(res.chosen)
+        obj[m] = res.objective
+    return pd.concat(chosen), obj
 
 
 def optimise(base: pd.DataFrame, config: OptimizerConfig, fleet: pd.DataFrame | None = None,
              cons: pd.DataFrame | None = None, cost_multiplier: float = 1.0) -> pd.DataFrame:
-    """Return the chosen option row for every sector-month."""
+    """Return the chosen option row for every sector-month.
+
+    Months are solved independently. New routes with a one-off launch cost are
+    then tested: a launched route must earn back its launch cost in extra network
+    contribution (re-solving the months it flies without it, so aircraft
+    redeployed to it are valued at what they would have earned elsewhere). The
+    route with the largest shortfall is dropped and the test repeats.
+    """
     config.validate()
     opts = build_options(base, config, cons, cost_multiplier)
     cap = fleet_capacity(base, fleet, config)
     missing = set(base["fleet_type"]) - set(cap["fleet_type"])
     if missing:
-        raise ValueError(f"No fleet capacity for fleet types {sorted(missing)}")
-    chosen = []
-    for m, base_m in base.groupby("month"):
-        res = solve_month(opts[opts["month"] == m], base_m, cap[cap["month"] == m], config)
-        chosen.append(res.chosen)
-    return pd.concat(chosen).set_index("base_idx").sort_index()
+        raise ValueError(f"No fleet capacity for fleet types {sorted(missing)} (add them to the fleet file)")
+    months = sorted(base["month"].unique())
+
+    launch = (base[base["launch_cost"] > 0].assign(route=lambda d: d["sector"].map(_route_key))
+              .drop_duplicates("sector").groupby("route")["launch_cost"].sum())
+    forbid: frozenset = frozenset()
+    while True:
+        chosen, obj = _solve_months(opts, base, cap, config, months, forbid)
+        flown = chosen[(chosen["weekly_freq"] > 0)].assign(route=lambda d: d["sector"].map(_route_key))
+        shortfall = {}
+        for route, cost in launch.items():
+            if route in forbid:
+                continue
+            fm = sorted(flown.loc[flown["route"] == route, "month"].unique())
+            if not fm:
+                continue
+            _, obj_wo = _solve_months(opts, base, cap, config, fm, forbid | {route})
+            value = sum(obj[m] - obj_wo[m] for m in fm)
+            if value < cost:
+                shortfall[route] = cost - value
+        if not shortfall:
+            break
+        forbid = forbid | {max(shortfall, key=shortfall.get)}
+    return chosen.set_index("base_idx").sort_index()
