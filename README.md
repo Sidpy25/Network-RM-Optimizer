@@ -26,6 +26,30 @@ python -m network_rm_optimizer optimise \
     --out results/network_plan.xlsx
 ```
 
+### Dashboard
+
+```bash
+streamlit run app.py
+```
+
+Opens in the browser. Use the **sample network** or upload your own history and
+cost files (CSV/Excel; templates can be downloaded from the sidebar), then:
+* set assumptions in the sidebar: objective, growth, elasticities, cost split,
+  fleet utilisation floor, frequency limits, market protection and ATF scenarios,
+* optionally override demand growth, fare change or frequency elasticity per market,
+* press **Run optimiser**.
+
+| Tab | Shows |
+|---|---|
+| Network | KPI tiles vs LY schedule at new cost, monthly net profit, monthly summary, fleet block-hour use |
+| Markets | Full-year net profit by market (LY schedule vs recommended) and market KPIs |
+| Schedule | Sector × month heatmap: recommended weekly frequency, coloured by change vs LY |
+| Sector plan | Filterable sector-month plan with actions, LF, fare, break-even LF and ±1/wk marginal value |
+| ATF scenarios | Network net profit per fuel scenario and which decisions change with ATF |
+| Download | Full Excel workbook, plan CSV, assumptions used |
+
+### Python / notebook
+
 From Python or a notebook:
 
 ```python
