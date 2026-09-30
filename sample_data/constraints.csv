@@ -1,0 +1,5 @@
+sector,min_weekly,must_operate,note
+DEL-BOM,35,1,Trunk route - protect presence
+BOM-DEL,35,1,Trunk route - protect presence
+CCU-IXB,3,1,Regional connectivity commitment
+IXB-CCU,3,1,Regional connectivity commitment
