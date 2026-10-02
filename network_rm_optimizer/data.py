@@ -378,6 +378,9 @@ def prepare_new_routes(path_or_df, base: pd.DataFrame, config: OptimizerConfig,
         out[c] = 0.0
     for c in ["ly_load_factor", "ly_avg_fare", "ly_rask", "ly_cask", "ly_cost_per_departure"]:
         out[c] = np.nan
+    for c in ["ly_conn_pax", "ly_conn_revenue", "ly_local_pax", "ly_local_revenue"]:
+        out[c] = 0.0
+    out["local_seat_share"] = 1.0
     return out
 
 

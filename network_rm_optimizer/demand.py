@@ -67,6 +67,9 @@ def calibrate(base: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
     """Set reference demand/fare for existing sectors and planning-year growth factors."""
     b = base.copy()
     b["is_new"] = b["is_new"].fillna(False).astype(bool)
+    if "local_seat_share" not in b.columns:
+        from .od import split_local  # no O&D file: all traffic is local
+        b = split_local(b, None)
     old = ~b["is_new"]
     for c in ("ref_weekly_freq", "ref_seats", "ref_demand", "ref_fare", "ly_spill_pax"):
         if c not in b.columns:
@@ -74,12 +77,15 @@ def calibrate(base: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
     if "growth_applies" not in b.columns:
         b["growth_applies"] = True
     b["growth_applies"] = b["growth_applies"].fillna(True).astype(bool)
-    demand = unconstrain_demand(b.loc[old, "ly_pax"], b.loc[old, "ly_seats"], config.demand_cv)
+    # Local traffic only: connecting passengers are modelled as O&D flows.
+    local_pax = b.loc[old, "ly_local_pax"]
+    local_seats = b.loc[old, "ly_seats"] * b.loc[old, "local_seat_share"]
+    demand = unconstrain_demand(local_pax, local_seats, config.demand_cv)
     b.loc[old, "ref_demand"] = demand
-    b.loc[old, "ly_spill_pax"] = demand - b.loc[old, "ly_pax"]
+    b.loc[old, "ly_spill_pax"] = demand - local_pax
     b.loc[old, "ref_weekly_freq"] = b.loc[old, "ly_weekly_freq"]
     b.loc[old, "ref_seats"] = b.loc[old, "ly_seats"]
-    b.loc[old, "ref_fare"] = b.loc[old, "ly_avg_fare"]
+    b.loc[old, "ref_fare"] = (b.loc[old, "ly_local_revenue"] / local_pax.where(local_pax > 0)).fillna(0.0)
     b["demand_growth"] = b["market"].map(config.market_demand_growth).fillna(config.demand_growth)
     b.loc[~b["growth_applies"], "demand_growth"] = 0.0
     b["fare_growth"] = b["market"].map(config.market_fare_growth).fillna(config.fare_growth)
@@ -89,7 +95,11 @@ def calibrate(base: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
 
 
 def evaluate(rows: pd.DataFrame, weekly, config: OptimizerConfig, cost_multiplier=1.0) -> pd.DataFrame:
-    """Sector-month P&L at the given weekly frequency (one value per row)."""
+    """Sector-month P&L at the given weekly frequency (one value per row).
+
+    Revenue, pax and contribution here are LOCAL traffic only; connecting O&D
+    flows are added by the optimiser / pipeline.
+    """
     r = rows
     weekly = np.asarray(weekly, dtype=float)
     deps = weekly * r["days_in_month"].to_numpy() / 7.0
@@ -104,7 +114,10 @@ def evaluate(rows: pd.DataFrame, weekly, config: OptimizerConfig, cost_multiplie
               * np.power(ratio_f, r["frequency_elasticity"].to_numpy()))
         fare = r["ref_fare"].to_numpy() * (1 + r["fare_growth"].to_numpy()) * np.where(
             ratio_s > 0, np.power(np.where(ratio_s > 0, ratio_s, 1.0), -config.fare_capacity_elasticity), 0.0)
-    pax = expected_sales(mu, config.demand_cv, seats)
+    # Local passengers compete for the local share of seats; the rest are for
+    # connecting O&D flows (decided in the optimiser).
+    local_share = r["local_seat_share"].to_numpy()
+    pax = expected_sales(mu, config.demand_cv, seats * local_share)
     revenue = pax * fare
 
     cpd = r["new_cost_per_departure"].to_numpy() * (1 + r["fuel_share"].to_numpy() * (np.asarray(cost_multiplier) - 1))
@@ -128,6 +141,8 @@ def evaluate(rows: pd.DataFrame, weekly, config: OptimizerConfig, cost_multiplie
         "contribution": revenue - variable_cost,
         "profit": revenue - total_cost,  # fully allocated
         "block_hours": deps * r["block_hours_per_dep"].to_numpy(),
+        "conn_seats": seats * (1 - local_share),
+        "conn_mult": np.power(ratio_f, config.connecting_frequency_elasticity),
     }, index=r.index)
     out["rask"] = np.divide(revenue, ask, out=np.zeros_like(revenue), where=ask > 0)
     out["cask"] = np.divide(total_cost, ask, out=np.zeros_like(revenue), where=ask > 0)

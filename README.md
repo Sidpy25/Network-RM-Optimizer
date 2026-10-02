@@ -24,6 +24,7 @@ python -m network_rm_optimizer optimise \
     --fleet sample_data/fleet.csv \
     --constraints sample_data/constraints.csv \
     --new-routes sample_data/new_routes.csv \
+    --od sample_data/od_connecting.csv \
     --out results/network_plan.xlsx
 ```
 
@@ -45,6 +46,7 @@ cost files (CSV/Excel; templates can be downloaded from the sidebar), then:
 | Network | KPI tiles vs LY schedule at new cost, monthly net profit, monthly summary, fleet block-hour use |
 | Markets | Full-year net profit by market (LY schedule vs recommended) and market KPIs |
 | Schedule | Sector × month heatmap: recommended weekly frequency, coloured by change vs LY |
+| Connections | Sector vs network contribution (what each sector feeds), connecting O&D pax and revenue, weakest legs |
 | Sector plan | Filterable sector-month plan with actions, LF, fare, break-even LF and ±1/wk marginal value |
 | New routes | Launch / not-launch decision per candidate route, first-year economics, monthly plan |
 | ATF scenarios | Network net profit per fuel scenario and which decisions change with ATF |
@@ -71,6 +73,7 @@ write_excel(res, "network_plan.xlsx")
 | **cost_forecast** (new year) | `month`, `sector`, and one of `cost_per_departure` / `cask` / `total_cost` + `planned_departures` | `fuel_share`, `variable_cost_share` per sector |
 | **fleet** | `fleet_type`, `aircraft`, `block_hours_per_day` | `seats` |
 | **constraints** | `sector` | `month`, `min_weekly`, `max_weekly`, `fixed_weekly`, `must_operate` |
+| **od** (connecting traffic LY, one row per itinerary per month) | `month`, `legs` (`DXB-BOM;BOM-BLR` in travel order, or `leg1`, `leg2`, …), `pax`, `revenue` (total itinerary revenue) or `avg_fare` | `od` (label) |
 | **new_routes** (routes not flown LY) | `sector` (or `origin`+`destination`), `distance_km`, and either `est_daily_pax` + `est_avg_fare` **or** `proxy_sector` | `market`, `fleet_type`, `seats_per_flight`, `block_hours`, `ref_weekly` (7), `demand_scale`, `fare_scale`, `start_month`, `ramp_months`, `ramp_start`, `launch_cost`, `max_weekly`, `both_directions` (1) |
 
 Without a fleet file, each month may use at most last year's block hours
@@ -103,6 +106,36 @@ Without a fleet file, each month may use at most last year's block hours
    0.85× / 1.0× / 1.15× / 1.30× the estimate. Each sector is tagged
    STABLE / ATF-SENSITIVE / AT RISK, so you know which decisions hold whatever
    fuel does.
+
+### Connecting traffic (O&D)
+Without an O&D file every sector is judged on its own revenue. A sector that
+loses money locally but feeds valuable connections (e.g. BOM-BLR feeding
+DXB-BOM) then looks like a cut candidate, although cutting it also loses
+revenue on the Gulf leg. With the `od` file:
+
+* Each leg's LY pax and revenue are split into **connecting** traffic (the sum
+  of O&Ds using it, with itinerary revenue prorated to legs by distance) and
+  **local** traffic (the rest). Local traffic keeps the sector demand/fare
+  model, on the leg's local share of seats.
+* Each O&D is a **flow** in the optimiser that earns its full itinerary fare
+  **once**. On every leg it is capped at
+  `demand × (leg frequency / LY frequency) ^ connecting_frequency_elasticity`
+  (default 0.8). So **dropping any leg kills the O&D**, and fewer frequencies
+  mean fewer workable connections. Connecting pax also need seats: the flows on
+  a leg can't exceed its connecting share of seats.
+* At last year's schedule, local + connecting revenue reproduces LY revenue
+  per sector, so nothing is double counted.
+* Reported per sector: connecting pax, its own (prorated) share of connecting
+  revenue, **beyond revenue** (what its connecting passengers bring on their
+  other legs), and **network contribution** = sector contribution + beyond
+  revenue, i.e. what the network loses if the sector is cut. Results are in
+  the `od_flows` sheet (per O&D: LY vs recommended pax and revenue, and the
+  weakest leg holding it back) and the **Connections** dashboard tab.
+
+On the sample network, the local-only plan is worth ₹81.9 Cr net profit once
+the connections it breaks are counted (it claimed ₹115 Cr). The
+connection-aware plan earns ₹95.6 Cr: it raises BOM-BLR from ~24 to ~35/wk and
+keeps BOM-GOI at ~12/wk, because both feed Gulf traffic.
 
 ### New routes (not flown last year)
 List candidate routes in `new_routes.csv`. The model builds the same demand/fare
@@ -160,6 +193,7 @@ Then:
 | `sector_annual` | Per sector: annual P&L, LY vs recommended average weekly frequency, months operated |
 | `plan` | Per sector-month: action (ADD/CUT/MAINTAIN/DROP), weekly and daily frequency, pattern ("2x daily + 3/wk"), LF, fare, RASK/CASK, cost change, contribution and net profit uplift, break-even LF, spilled pax, **marginal value of ±1 weekly frequency**, `at_max_frequency` flag |
 | `fleet_utilisation` | Block hours available vs LY vs recommended |
+| `od_flows` | Per connecting O&D (full year and by month): LY, demand, at-LY-schedule and recommended pax and revenue, weakest leg |
 | `new_routes` | Launch decision and first-year economics per new sector (when a new-routes file is given) |
 | `new_route_scenarios`, `new_route_scenario_summary` | Launch decision, frequency and yr-1 result per new route at each demand scale, with a verdict |
 | `atf_frequencies`, `atf_summary` | Frequencies and network P&L under each ATF scenario, plus the robustness tag |
@@ -177,7 +211,7 @@ Then:
 
 ## Key parameters (`OptimizerConfig`, CLI flags or `--config params.json`)
 `objective`, `demand_growth`, `fare_growth`, `market_demand_growth`,
-`market_fare_growth`, `frequency_elasticity`, `market_frequency_elasticity`,
+`market_fare_growth`, `frequency_elasticity`, `market_frequency_elasticity`, `connecting_frequency_elasticity`,
 `fare_capacity_elasticity`, `demand_cv`, `variable_cost_share`, `fuel_share`,
 `min_weekly_if_operated`, `max_weekly_multiplier`, `pair_directions`,
 `new_route_ramp_months`, `new_route_ramp_start`, `new_route_demand_scenarios`,
@@ -189,7 +223,13 @@ Then:
 * Launch decisions are tested one route at a time (the worst one is dropped and
   the rest re-tested). This is exact for independent routes, but approximate
   when several new routes compete for the same aircraft.
-* No connecting-traffic (O&D) effects. Each sector is valued on local revenue.
+* O&D effects need the O&D file. The split of seats between local and
+  connecting traffic is fixed at last year's mix (no re-optimisation of RM
+  controls between the two). Connecting pax who lose their connection are
+  assumed lost (no recapture on another path). New routes don't create new
+  connections yet.
+* The ±1/wk marginal columns value local traffic only; connecting effects of a
+  frequency change are in the optimiser's choice, not in those columns.
 * No competitor response beyond what the elasticities capture.
 * Frequencies are chosen per month. Add smoothing constraints if schedule
   stability across months matters.

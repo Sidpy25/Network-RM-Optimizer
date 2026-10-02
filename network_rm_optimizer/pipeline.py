@@ -7,7 +7,8 @@ import pandas as pd
 from .config import OptimizerConfig
 from .data import load_constraints, load_fleet, prepare_costs, prepare_history, prepare_new_routes
 from .demand import calibrate, evaluate, frequency_options
-from .optimizer import fleet_capacity, optimise
+from .od import allocate_flows, load_od, od_demand, split_local
+from .optimizer import fleet_capacity, optimise_full
 
 METRICS = ["departures", "seats", "ask", "pax", "revenue", "variable_cost", "total_cost",
            "contribution", "profit", "block_hours"]
@@ -82,13 +83,50 @@ def summarise(plan: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     return g[[c for c in front if c in g.columns]]
 
 
+def baseline_flows(od: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
+    """O&D flows if last year's schedule is flown: demand, capped by connecting seats."""
+    lr = [(r.od_id, r.month, leg, r.demand) for r in od.itertuples() for leg in r.leg_list]
+    lr = pd.DataFrame(lr, columns=["od_id", "month", "sector", "demand"])
+    seats = base.assign(cs=base["ly_seats"] * (1 - base["local_seat_share"])).set_index(["sector", "month"])["cs"]
+    tot = lr.groupby(["sector", "month"])["demand"].transform("sum")
+    lr["ratio"] = seats.reindex(pd.MultiIndex.from_frame(lr[["sector", "month"]])).to_numpy() / tot.where(tot > 0)
+    scale = lr.groupby("od_id")["ratio"].min().clip(upper=1.0)
+    return pd.DataFrame({"od_id": od["od_id"], "month": od["month"],
+                         "pax": od["demand"] * od["od_id"].map(scale).fillna(1.0), "fare": od["plan_fare"]})
+
+
+def _add_connecting(plan: pd.DataFrame, prefix: str, alloc: pd.DataFrame | None) -> pd.DataFrame:
+    """Add connecting pax/revenue (prorated) and beyond revenue to a P&L prefix."""
+    key = pd.MultiIndex.from_frame(plan[["sector", "month"]])
+    # LY connecting pax/revenue already come from split_local; only beyond is new.
+    cols = ("beyond_revenue",) if prefix == "ly_" else ("conn_pax", "conn_revenue", "beyond_revenue")
+    for c in cols:
+        plan[f"{prefix}{c}"] = (alloc[c].reindex(key).fillna(0.0).to_numpy() if alloc is not None
+                                else np.zeros(len(plan)))
+    if prefix == "ly_":
+        return plan
+    plan[f"{prefix}local_pax"] = plan[f"{prefix}pax"]
+    plan[f"{prefix}local_revenue"] = plan[f"{prefix}revenue"]
+    plan[f"{prefix}pax"] = plan[f"{prefix}pax"] + plan[f"{prefix}conn_pax"]
+    for c in ("revenue", "contribution", "profit"):
+        plan[f"{prefix}{c}"] = plan[f"{prefix}{c}"] + plan[f"{prefix}conn_revenue"]
+    plan[f"{prefix}network_contribution"] = plan[f"{prefix}contribution"] + plan[f"{prefix}beyond_revenue"]
+    return plan
+
+
 def build_plan(base: pd.DataFrame, chosen: pd.DataFrame, config: OptimizerConfig,
-               cons: pd.DataFrame | None = None) -> pd.DataFrame:
+               cons: pd.DataFrame | None = None, od: pd.DataFrame | None = None,
+               flows: pd.DataFrame | None = None) -> pd.DataFrame:
     plan = base.copy()
     rec = chosen[METRICS + ["weekly_freq", "avg_fare", "cost_per_departure"]].add_prefix("rec_")
     plan = plan.join(rec)
     baseline = evaluate(base, base["ly_weekly_freq"], config)[METRICS].add_prefix("base_")
     plan = plan.join(baseline)
+    has_od = od is not None and len(od) > 0
+    plan = _add_connecting(plan, "rec_", allocate_flows(flows, od) if has_od else None)
+    plan = _add_connecting(plan, "base_", allocate_flows(baseline_flows(od, base), od) if has_od else None)
+    plan = _add_connecting(plan, "ly_", allocate_flows(od.assign(fare=od["fare"].fillna(0.0)), od)
+                           if has_od else None)
     plan["ly_total_cost"] = plan["ly_cost"]
     plan["ly_profit"] = plan["ly_revenue"] - plan["ly_cost"]
     plan["ly_net_profit"] = plan["ly_profit"]
@@ -118,9 +156,10 @@ def build_plan(base: pd.DataFrame, chosen: pd.DataFrame, config: OptimizerConfig
     # Marginal value of one more / one fewer weekly frequency (RM talking point).
     obj = config.objective
     w = plan["rec_weekly_freq"].to_numpy()
+    # (local traffic only - connecting flows are re-balanced by the optimiser)
     up = evaluate(base, w + 1, config)[obj].to_numpy()
     dn = evaluate(base, np.maximum(w - 1, 0), config)[obj].to_numpy()
-    cur = plan[f"rec_{obj}"].to_numpy()
+    cur = chosen.loc[plan.index, obj].to_numpy()
     plan[f"marginal_{obj}_plus1_wk"] = up - cur
     plan[f"marginal_{obj}_minus1_wk"] = np.where(w > 0, dn - cur, np.nan)
     # Frequency pinned at the top of its allowed range: raise max_weekly_multiplier
@@ -142,6 +181,8 @@ PLAN_COLUMNS = [
     "base_profit", "rec_profit",
     "breakeven_lf_full_cost", "breakeven_lf_variable",
     "rec_launch_cost", "ly_spill_pax", "rec_pax", "rec_ask", "rec_block_hours",
+    "ly_conn_pax", "rec_local_pax", "rec_conn_pax", "rec_local_revenue", "rec_conn_revenue",
+    "rec_beyond_revenue", "rec_network_contribution",
 ]
 
 
@@ -149,7 +190,11 @@ def sector_annual(plan: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
     s = summarise(plan, ["market", "sector"])
     freq = plan.groupby("sector").agg(ly_avg_weekly=("ly_weekly_freq", "mean"),
                                       rec_avg_weekly=("rec_weekly_freq", "mean"),
-                                      months_operated=("rec_weekly_freq", lambda v: int((v > 0).sum())))
+                                      months_operated=("rec_weekly_freq", lambda v: int((v > 0).sum())),
+                                      rec_conn_pax=("rec_conn_pax", "sum"),
+                                      rec_conn_revenue=("rec_conn_revenue", "sum"),
+                                      rec_beyond_revenue=("rec_beyond_revenue", "sum"),
+                                      rec_network_contribution=("rec_network_contribution", "sum"))
     s = s.merge(freq, on="sector")
     return s.sort_values(f"rec_{config.objective}", ascending=False)
 
@@ -183,15 +228,48 @@ def _route_key(sector: str) -> str:
     return "-".join(sorted(sector.split("-")))
 
 
-def _network_net_profit(ch: pd.DataFrame, base: pd.DataFrame, cost_multiplier: float = 1.0) -> float:
-    """Contribution - fixed cost pool - launch costs of routes flown, for a chosen plan."""
+def _flow_revenue(flows: pd.DataFrame | None) -> float:
+    return float((flows["pax"] * flows["fare"]).sum()) if flows is not None and len(flows) else 0.0
+
+
+def _network_net_profit(ch: pd.DataFrame, base: pd.DataFrame, cost_multiplier: float = 1.0,
+                        flows: pd.DataFrame | None = None) -> float:
+    """Contribution (incl. connecting revenue) - fixed cost pool - launch costs, for a chosen plan."""
     cpd = base["new_cost_per_departure"] * (1 + base["fuel_share"] * (cost_multiplier - 1))
     fixed = ((1 - base["variable_cost_share"]) * cpd * base["ly_departures"]).sum()
     launched = ch.loc[ch["weekly_freq"] > 0, ["sector", "launch_cost"]].drop_duplicates("sector")
-    return float(ch["contribution"].sum() - fixed - launched["launch_cost"].sum())
+    return float(ch["contribution"].sum() + _flow_revenue(flows) - fixed - launched["launch_cost"].sum())
 
 
-def run_new_route_demand_scenarios(base, config, fleet, cons, chosen_base) -> tuple[pd.DataFrame, pd.DataFrame]:
+def od_summary(od: pd.DataFrame, flows: pd.DataFrame, base_fl: pd.DataFrame, plan: pd.DataFrame,
+               config: OptimizerConfig) -> pd.DataFrame:
+    """Per O&D-month: LY vs baseline vs recommended pax and revenue, and the limiting leg."""
+    w = plan.set_index(["sector", "month"])[["rec_weekly_freq", "ly_weekly_freq"]]
+    rows = []
+    rec = flows.set_index("od_id")["pax"]
+    bas = base_fl.set_index("od_id")["pax"]
+    for r in od.itertuples():
+        mults = {leg: (w.at[(leg, r.month), "rec_weekly_freq"] / w.at[(leg, r.month), "ly_weekly_freq"])
+                 ** config.connecting_frequency_elasticity for leg in r.leg_list}
+        weakest = min(mults, key=mults.get)
+        rp = float(rec.get(r.od_id, 0.0))
+        rows.append({"month": r.month, "od": r.od, "path": r.path, "ly_pax": r.pax, "ly_revenue": r.revenue,
+                     "demand": r.demand, "base_pax": float(bas.get(r.od_id, 0.0)), "rec_pax": rp,
+                     "fare": r.plan_fare, "rec_revenue": rp * r.plan_fare,
+                     "lost_pax_vs_demand": r.demand - rp,
+                     "weakest_leg": weakest if mults[weakest] < 0.999 else "",
+                     "weakest_leg_freq_ratio": mults[weakest] ** (1 / config.connecting_frequency_elasticity)})
+    m = pd.DataFrame(rows)
+    yr = m.groupby(["od", "path"], as_index=False)[["ly_pax", "ly_revenue", "demand", "base_pax", "rec_pax",
+                                                     "rec_revenue", "lost_pax_vs_demand"]].sum()
+    yr["month"] = "FULL YEAR"
+    return pd.concat([yr, m], ignore_index=True)[
+        ["od", "path", "month", "ly_pax", "ly_revenue", "demand", "base_pax", "rec_pax", "rec_revenue",
+         "fare", "lost_pax_vs_demand", "weakest_leg", "weakest_leg_freq_ratio"]]
+
+
+def run_new_route_demand_scenarios(base, config, fleet, cons, chosen_base, od=None,
+                                   flows_base=None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Re-optimise with every new route's demand scaled; report decisions per route.
 
     Routes are reported per city pair (both directions together, launch cost
@@ -201,12 +279,12 @@ def run_new_route_demand_scenarios(base, config, fleet, cons, chosen_base) -> tu
     rows = []
     for scale in sorted(config.new_route_demand_scenarios):
         if np.isclose(scale, 1.0):
-            ch = chosen_base
+            ch, fl = chosen_base, flows_base
         else:
             b = base.copy()
             b.loc[new, "ref_demand"] = b.loc[new, "ref_demand"] * scale
-            ch = optimise(b, config, fleet, cons)
-        net = _network_net_profit(ch, base)
+            ch, fl = optimise_full(b, config, fleet, cons, od=od)
+        net = _network_net_profit(ch, base, flows=fl)
         n = ch[ch["is_new"]].assign(route=lambda d: d["sector"].map(_route_key))
         launch = (base[new].drop_duplicates("sector").assign(route=lambda d: d["sector"].map(_route_key))
                   .groupby("route")["launch_cost"].sum())
@@ -253,14 +331,21 @@ def run_new_route_demand_scenarios(base, config, fleet, cons, chosen_base) -> tu
     return long, summary
 
 
-def run_scenarios(base, config, fleet, cons) -> tuple[pd.DataFrame, pd.DataFrame]:
+def run_scenarios(base, config, fleet, cons, od=None) -> tuple[pd.DataFrame, pd.DataFrame]:
     freqs, totals = {}, []
     for mult in config.atf_scenarios:
-        ch = optimise(base, config, fleet, cons, cost_multiplier=mult)
+        ch, fl = optimise_full(base, config, fleet, cons, cost_multiplier=mult, od=od)
         label = f"ATF x{mult:.2f}"
         freqs[label] = ch["weekly_freq"]
         tot = ch[["revenue", "total_cost", "contribution", "profit", "ask", "pax", "seats"]].sum()
-        tot["net_profit"] = _network_net_profit(ch, base, mult)
+        conn_rev = _flow_revenue(fl)
+        for c in ("revenue", "contribution", "profit"):
+            tot[c] += conn_rev
+        if fl is not None and len(fl):
+            # Connecting pax occupy a seat on every leg they fly.
+            legs = od.set_index("od_id")["leg_list"].map(len)
+            tot["pax"] += float((fl["pax"] * fl["od_id"].map(legs)).sum())
+        tot["net_profit"] = _network_net_profit(ch, base, mult, fl)
         totals.append({"scenario": label, "atf_multiplier": mult,
                        "sectors_months_operated": int((ch["weekly_freq"] > 0).sum()),
                        **tot.to_dict(),
@@ -280,19 +365,22 @@ def run_scenarios(base, config, fleet, cons) -> tuple[pd.DataFrame, pd.DataFrame
 
 def run(history, cost_forecast, fleet=None, constraints=None,
         config: OptimizerConfig | None = None, scenarios: bool = True,
-        new_routes=None) -> dict[str, pd.DataFrame]:
+        new_routes=None, od=None) -> dict[str, pd.DataFrame]:
     config = config or OptimizerConfig()
     config.validate()
     fleet_df = load_fleet(fleet)
-    base = calibrate(prepare_history(history, config, fleet_df), config)
+    base = prepare_history(history, config, fleet_df)
+    od_raw = load_od(od, base, config) if od is not None else None
+    base = calibrate(split_local(base, od_raw), config)
     if new_routes is not None:
         nr = prepare_new_routes(new_routes, base, config, fleet_df)
         base = calibrate(pd.concat([base, nr], ignore_index=True), config)
     base = prepare_costs(cost_forecast, base, config)
     cons = load_constraints(constraints)
+    od_d = od_demand(od_raw, base, config) if od_raw is not None else None
 
-    chosen = optimise(base, config, fleet_df, cons)
-    plan = build_plan(base, chosen, config, cons)
+    chosen, flows = optimise_full(base, config, fleet_df, cons, od=od_d)
+    plan = build_plan(base, chosen, config, cons, od_d, flows)
 
     cap = fleet_capacity(base, fleet_df, config)
     used = plan.groupby(["month", "fleet_type"], as_index=False).agg(
@@ -310,13 +398,15 @@ def run(history, cost_forecast, fleet=None, constraints=None,
                      + [c for c in plan.columns if c.startswith("marginal_")]],
         "fleet_utilisation": fleet_use,
     }
+    if od_d is not None:
+        out["od_flows"] = od_summary(od_d, flows, baseline_flows(od_d, base), plan, config)
     if base["is_new"].any():
         out["new_routes"] = new_route_summary(plan, config)
         if scenarios and config.new_route_demand_scenarios:
             out["new_route_scenarios"], out["new_route_scenario_summary"] = (
-                run_new_route_demand_scenarios(base, config, fleet_df, cons, chosen))
+                run_new_route_demand_scenarios(base, config, fleet_df, cons, chosen, od_d, flows))
     if scenarios and config.atf_scenarios:
-        out["atf_frequencies"], out["atf_summary"] = run_scenarios(base, config, fleet_df, cons)
+        out["atf_frequencies"], out["atf_summary"] = run_scenarios(base, config, fleet_df, cons, od_d)
     out["assumptions"] = pd.DataFrame(
         [(k, str(v)) for k, v in config.to_dict().items()], columns=["parameter", "value"])
     return out

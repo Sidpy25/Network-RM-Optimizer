@@ -62,6 +62,12 @@ class OptimizerConfig:
     # Force A-B and B-A to run the same weekly frequency.
     pair_directions: bool = True
 
+    # --- Connecting traffic (O&D file) --------------------------------------
+    # % change in a connecting O&D's demand per 1% frequency change on its
+    # weakest leg. Higher than local: fewer flights mean fewer workable
+    # connections as well as less choice.
+    connecting_frequency_elasticity: float = 0.8
+
     # --- New routes ----------------------------------------------------------
     # Demand in launch month = ramp_start x mature demand, rising linearly to
     # 100% after ramp_months (overridable per route in the new_routes file).

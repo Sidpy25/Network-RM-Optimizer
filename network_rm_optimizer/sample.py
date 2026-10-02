@@ -92,6 +92,22 @@ def generate(out_dir: str, ly_year: int = 2025, seed: int = 7) -> dict[str, str]
         for m in range(1, 13):
             cpd = (3.3 + 900 / dist) * SEATS * dist * (1 + 0.40 * ATF_CHANGE[m - 1]) * 1.03
             cost.append({"month": m, "sector": sector, "cost_per_departure": round(cpd), "fuel_share": 0.40})
+    # Connecting O&Ds last year: share of the thinner leg's traffic, at a
+    # discount to the sum of the two leg fares.
+    lp = h.assign(m=h["month"].str[-2:].astype(int),
+                  pax=h["load_factor"] / 100 * h["departures"] * SEATS)
+    lp["fare"] = lp["revenue"] / lp["pax"]
+    lp = lp.set_index(["sector", "m"])
+    od_rows = []
+    for legs, share, disc in [
+        (("DXB-BOM", "BOM-BLR"), 0.20, 0.80), (("BLR-BOM", "BOM-DXB"), 0.20, 0.80),
+        (("DXB-BOM", "BOM-GOI"), 0.10, 0.85), (("GOI-BOM", "BOM-DXB"), 0.10, 0.85),
+        (("DEL-BLR", "BLR-HYD"), 0.12, 0.80), (("HYD-BLR", "BLR-DEL"), 0.12, 0.80),
+    ]:
+        for m in range(1, 13):
+            pax = share * min(lp.at[(leg, m), "pax"] for leg in legs)
+            fare = disc * sum(lp.at[(leg, m), "fare"] for leg in legs)
+            od_rows.append({"month": m, "legs": ";".join(legs), "pax": round(pax), "revenue": round(pax * fare)})
     os.makedirs(out_dir, exist_ok=True)
     paths = {
         "history": os.path.join(out_dir, "history_ly.csv"),
@@ -99,10 +115,12 @@ def generate(out_dir: str, ly_year: int = 2025, seed: int = 7) -> dict[str, str]
         "fleet": os.path.join(out_dir, "fleet.csv"),
         "constraints": os.path.join(out_dir, "constraints.csv"),
         "new_routes": os.path.join(out_dir, "new_routes.csv"),
+        "od": os.path.join(out_dir, "od_connecting.csv"),
     }
     h.to_csv(paths["history"], index=False)
     pd.DataFrame(cost).to_csv(paths["costs"], index=False)
     fleet.to_csv(paths["fleet"], index=False)
     cons.to_csv(paths["constraints"], index=False)
     new_routes.to_csv(paths["new_routes"], index=False)
+    pd.DataFrame(od_rows).to_csv(paths["od"], index=False)
     return paths

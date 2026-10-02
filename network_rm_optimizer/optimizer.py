@@ -8,7 +8,9 @@ network contribution (or net profit), subject to:
   * sector min / max / must-operate / fixed frequencies,
   * a minimum share of last year's ASK per market (optional),
   * new routes launched only if they earn back their one-off launch cost
-    (see optimise).
+    (see optimise_full),
+  * connecting O&D flows (optional): each earns its itinerary fare once and is
+    capped by frequency-driven demand and connecting seats on every leg.
 The revenue curve is non-linear in frequency, so each candidate frequency is
 pre-computed (see demand.build_options) and the MILP chooses between them.
 """
@@ -31,6 +33,7 @@ class SolveResult:
     status: str
     objective: float
     chosen: pd.DataFrame
+    flows: pd.DataFrame  # O&D flows: od_id, month, pax, fare (empty without O&D data)
 
 
 def fleet_capacity(base: pd.DataFrame, fleet: pd.DataFrame | None, config: OptimizerConfig) -> pd.DataFrame:
@@ -52,12 +55,32 @@ def solve_block(*args, **kwargs) -> SolveResult:
 
 
 def _solve_block(opts: pd.DataFrame, base_b: pd.DataFrame, cap_b: pd.DataFrame,
-                 config: OptimizerConfig) -> SolveResult:
+                 config: OptimizerConfig, od_b: pd.DataFrame | None = None) -> SolveResult:
     """Solve one or more months in a single model."""
     months = sorted(base_b["month"].unique())
     prob = pulp.LpProblem("network_" + "_".join(map(str, months)), pulp.LpMaximize)
     x = {i: pulp.LpVariable(f"x_{i}", cat="Binary") for i in opts.index}
-    prob += pulp.lpSum(opts.at[i, config.objective] * x[i] for i in opts.index)
+    obj = [opts.at[i, config.objective] * x[i] for i in opts.index]
+
+    # Connecting O&D flows: full itinerary fare earned once; capped on every leg
+    # by frequency-driven demand and by the leg's connecting seats.
+    y = {}
+    if od_b is not None and len(od_b):
+        leg_flows: dict[tuple, list] = {}
+        for r in od_b.itertuples():
+            if r.demand <= 0:
+                continue
+            v = pulp.LpVariable(f"y_{r.od_id}", lowBound=0)
+            y[r.od_id] = (v, r.month, r.plan_fare)
+            obj.append(r.plan_fare * v)
+            for leg in r.leg_list:
+                lo = opts[(opts["sector"] == leg) & (opts["month"] == r.month)]
+                prob += v <= pulp.lpSum(r.demand * lo.at[i, "conn_mult"] * x[i] for i in lo.index)
+                leg_flows.setdefault((leg, r.month), []).append(v)
+        for (leg, m), vs in leg_flows.items():
+            lo = opts[(opts["sector"] == leg) & (opts["month"] == m)]
+            prob += pulp.lpSum(vs) <= pulp.lpSum(lo.at[i, "conn_seats"] * x[i] for i in lo.index)
+    prob += pulp.lpSum(obj)
 
     for _, grp in opts.groupby(["sector", "month"]):
         prob += pulp.lpSum(x[i] for i in grp.index) == 1
@@ -103,29 +126,46 @@ def _solve_block(opts: pd.DataFrame, base_b: pd.DataFrame, cap_b: pd.DataFrame,
             "(e.g. must-operate frequencies need more block hours than the fleet has)."
         )
     chosen_idx = [i for i in opts.index if x[i].value() is not None and x[i].value() > 0.5]
-    return SolveResult(months, status, pulp.value(prob.objective), opts.loc[chosen_idx])
+    flows = pd.DataFrame([{"od_id": k, "month": m, "pax": max(0.0, v.value() or 0.0), "fare": f}
+                          for k, (v, m, f) in y.items()], columns=["od_id", "month", "pax", "fare"])
+    return SolveResult(months, status, pulp.value(prob.objective), opts.loc[chosen_idx], flows)
 
 
 def _route_key(sector: str) -> str:
     return "-".join(sorted(sector.split("-")))
 
 
-def _solve_months(opts, base, cap, config, months, forbid: frozenset) -> tuple[pd.DataFrame, dict]:
+def _solve_months(opts, base, cap, config, months, forbid: frozenset,
+                  od: pd.DataFrame | None = None) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
     """Solve each month independently; routes in `forbid` may only take frequency 0."""
-    chosen, obj = [], {}
+    chosen, obj, flows = [], {}, []
     if forbid:
         keys = opts["sector"].map(_route_key)
         opts = opts[~(keys.isin(forbid) & (opts["weekly_freq"] > 0))]
     for m in months:
-        res = solve_block(opts[opts["month"] == m], base[base["month"] == m], cap[cap["month"] == m], config)
+        od_m = od[od["month"] == m] if od is not None else None
+        res = solve_block(opts[opts["month"] == m], base[base["month"] == m], cap[cap["month"] == m],
+                          config, od_m)
         chosen.append(res.chosen)
+        flows.append(res.flows)
         obj[m] = res.objective
-    return pd.concat(chosen), obj
+    return pd.concat(chosen), obj, pd.concat(flows, ignore_index=True)
 
 
 def optimise(base: pd.DataFrame, config: OptimizerConfig, fleet: pd.DataFrame | None = None,
-             cons: pd.DataFrame | None = None, cost_multiplier: float = 1.0) -> pd.DataFrame:
-    """Return the chosen option row for every sector-month.
+             cons: pd.DataFrame | None = None, cost_multiplier: float = 1.0,
+             od: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Return the chosen option row for every sector-month (see optimise_full)."""
+    return optimise_full(base, config, fleet, cons, cost_multiplier, od)[0]
+
+
+def optimise_full(base: pd.DataFrame, config: OptimizerConfig, fleet: pd.DataFrame | None = None,
+                  cons: pd.DataFrame | None = None, cost_multiplier: float = 1.0,
+                  od: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (chosen option row per sector-month, O&D flows).
+
+    `od` is the planning-year O&D demand (od.od_demand); without it all traffic
+    is treated as local.
 
     Months are solved independently. New routes with a one-off launch cost are
     then tested: a launched route must earn back its launch cost in extra network
@@ -145,7 +185,7 @@ def optimise(base: pd.DataFrame, config: OptimizerConfig, fleet: pd.DataFrame | 
               .drop_duplicates("sector").groupby("route")["launch_cost"].sum())
     forbid: frozenset = frozenset()
     while True:
-        chosen, obj = _solve_months(opts, base, cap, config, months, forbid)
+        chosen, obj, flows = _solve_months(opts, base, cap, config, months, forbid, od)
         flown = chosen[(chosen["weekly_freq"] > 0)].assign(route=lambda d: d["sector"].map(_route_key))
         shortfall = {}
         for route, cost in launch.items():
@@ -154,11 +194,11 @@ def optimise(base: pd.DataFrame, config: OptimizerConfig, fleet: pd.DataFrame | 
             fm = sorted(flown.loc[flown["route"] == route, "month"].unique())
             if not fm:
                 continue
-            _, obj_wo = _solve_months(opts, base, cap, config, fm, forbid | {route})
+            _, obj_wo, _ = _solve_months(opts, base, cap, config, fm, forbid | {route}, od)
             value = sum(obj[m] - obj_wo[m] for m in fm)
             if value < cost:
                 shortfall[route] = cost - value
         if not shortfall:
             break
         forbid = forbid | {max(shortfall, key=shortfall.get)}
-    return chosen.set_index("base_idx").sort_index()
+    return chosen.set_index("base_idx").sort_index(), flows

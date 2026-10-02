@@ -44,11 +44,11 @@ def read_upload(f) -> pd.DataFrame | None:
 
 
 @st.cache_data(show_spinner=False)
-def optimise(history, costs, fleet, constraints, new_routes, cfg_dict, scenarios):
+def optimise(history, costs, fleet, constraints, new_routes, od, cfg_dict, scenarios):
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         res = run(history, costs, fleet, constraints, OptimizerConfig(**cfg_dict), scenarios=scenarios,
-                  new_routes=new_routes)
+                  new_routes=new_routes, od=od)
     msgs = sorted({str(x.message) for x in w if not issubclass(x.category, DeprecationWarning)})
     return res, msgs
 
@@ -68,6 +68,7 @@ if source == "Sample network":
     history, costs, fleet, constraints = (frames["history"], frames["costs"],
                                           frames["fleet"], frames["constraints"])
     new_routes = frames["new_routes"] if st.sidebar.checkbox("Include 3 candidate new routes", True) else None
+    od = frames["od"] if st.sidebar.checkbox("Include connecting traffic (O&D)", True) else None
     st.sidebar.caption("Synthetic Indian domestic + Gulf network, 18 sectors, INR.")
 else:
     history = read_upload(st.sidebar.file_uploader("LY sector-month history *", ["csv", "xlsx"]))
@@ -78,6 +79,9 @@ else:
         "New routes not flown LY (optional)", ["csv", "xlsx"],
         help="One row per candidate route: distance_km plus est_daily_pax + est_avg_fare, "
              "or a proxy_sector to borrow demand/fare/seasonality from. See the template."))
+    od = read_upload(st.sidebar.file_uploader(
+        "Connecting O&D traffic LY (optional)", ["csv", "xlsx"],
+        help="One row per connecting itinerary per month: month, legs ('DXB-BOM;BOM-BLR'), pax, revenue."))
     with st.sidebar.expander("Download input templates"):
         for k, df in sample_frames().items():
             st.download_button(f"{k}.csv", df.to_csv(index=False), f"{k}_template.csv", "text/csv",
@@ -98,6 +102,8 @@ fare_growth = c2.number_input("Fare change %", -50.0, 100.0, 0.0, 1.0) / 100
 with st.sidebar.expander("Demand & fare model"):
     freq_el = st.slider("Frequency elasticity", 0.0, 1.5, d.frequency_elasticity, 0.05,
                         help="% demand change per 1% frequency change. ~0.3 thin/monopoly, 0.6-0.9 competitive.")
+    conn_el = st.slider("Connecting frequency elasticity", 0.0, 2.0, d.connecting_frequency_elasticity, 0.05,
+                        help="% change in a connecting O&D's demand per 1% frequency change on its weakest leg.")
     fare_el = st.slider("Fare-capacity elasticity", 0.0, 0.5, d.fare_capacity_elasticity, 0.01,
                         help="% fare fall per 1% more seats (RM opens cheaper buckets).")
     cv = st.slider("Demand variability (CV)", 0.1, 0.6, d.demand_cv, 0.05,
@@ -164,6 +170,7 @@ except ValueError:
 cfg = dict(
     target_year=int(target_year), objective=objective, demand_cv=cv,
     frequency_elasticity=freq_el, fare_capacity_elasticity=fare_el,
+    connecting_frequency_elasticity=conn_el,
     demand_growth=demand_growth, fare_growth=fare_growth,
     market_demand_growth=_overrides("demand_growth_pct", 100),
     market_fare_growth=_overrides("fare_change_pct", 100),
@@ -181,7 +188,7 @@ if st.sidebar.button("▶ Run optimiser", type="primary", width="stretch") or "r
     with st.spinner("Calibrating demand and solving the network…"):
         try:
             st.session_state.res, st.session_state.msgs = optimise(
-                history, costs, fleet, constraints, new_routes, cfg, run_scen)
+                history, costs, fleet, constraints, new_routes, od, cfg, run_scen)
             st.session_state.cfg = cfg
         except Exception as e:  # show input / infeasibility problems to the user
             st.session_state.pop("res", None)
@@ -212,7 +219,8 @@ k[4].metric("RASK − CASK", f"{tot.rec_rask - tot.rec_cask:.3f}",
 st.caption("Deltas compare the recommendation with flying **last year's schedule at the new costs**. "
            f"LY actual net profit was {cr(tot.ly_net_profit)}.")
 
-tabs = st.tabs(["Network", "Markets", "Schedule", "Sector plan", "New routes", "ATF scenarios", "Download"])
+tabs = st.tabs(["Network", "Markets", "Schedule", "Sector plan", "Connections", "New routes", "ATF scenarios",
+                "Download"])
 
 # ----------------------------------------------------------------- Network tab
 with tabs[0]:
@@ -360,6 +368,7 @@ with tabs[3]:
     cols = ["month", "market", "sector", "action", "ly_weekly_freq", "rec_weekly_freq", "schedule_pattern",
             "ly_load_factor", "rec_load_factor", "ly_avg_fare", "rec_avg_fare", "cost_change_pct",
             "rec_contribution", "rec_net_profit", "net_profit_uplift_vs_base", "breakeven_lf_full_cost",
+            "rec_conn_pax", "rec_beyond_revenue",
             f"marginal_{obj}_plus1_wk", f"marginal_{obj}_minus1_wk", "at_max_frequency"]
     st.caption(f"{len(p)} sector-months. Marginal columns = change in {obj} from one more / one fewer "
                "weekly frequency.")
@@ -377,8 +386,10 @@ with tabs[3]:
         "rec_net_profit": st.column_config.NumberColumn("Net profit ₹", format="%.0f"),
         "net_profit_uplift_vs_base": st.column_config.NumberColumn("Uplift ₹", format="%.0f"),
         "breakeven_lf_full_cost": st.column_config.NumberColumn("Break-even LF", format="percent"),
-        f"marginal_{obj}_plus1_wk": st.column_config.NumberColumn("+1/wk ₹", format="%.0f"),
-        f"marginal_{obj}_minus1_wk": st.column_config.NumberColumn("−1/wk ₹", format="%.0f"),
+        "rec_conn_pax": st.column_config.NumberColumn("Connecting pax", format="%.0f"),
+        "rec_beyond_revenue": st.column_config.NumberColumn("Beyond revenue fed ₹", format="%.0f"),
+        f"marginal_{obj}_plus1_wk": st.column_config.NumberColumn("+1/wk ₹ (local)", format="%.0f"),
+        f"marginal_{obj}_minus1_wk": st.column_config.NumberColumn("−1/wk ₹ (local)", format="%.0f"),
         "at_max_frequency": st.column_config.CheckboxColumn("At max"),
     })
 
@@ -397,8 +408,71 @@ with tabs[3]:
         "rec_net_profit": st.column_config.NumberColumn("Recommended ₹Cr", format="%.2f"),
         "rec_load_factor": st.column_config.NumberColumn("Rec LF", format="percent")})
 
-# -------------------------------------------------------------- New routes tab
+# ------------------------------------------------------------- Connections tab
 with tabs[4]:
+    odf = res.get("od_flows")
+    if odf is None or odf.empty:
+        st.info("No connecting traffic in this run, so every sector is judged on its own revenue. Upload last "
+                "year's connecting O&Ds in the sidebar to credit sectors for the traffic they feed.")
+    else:
+        st.subheader("What each sector feeds the network")
+        st.caption("Sector contribution counts the sector's own share of connecting fares (prorated by "
+                   "distance). Network contribution adds the revenue its connecting passengers bring on their "
+                   "other legs, i.e. what the network loses if the sector is cut.")
+        sa_ = res["sector_annual"]
+        feed = sa_[sa_["rec_conn_pax"] > 0][["market", "sector", "rec_contribution", "rec_network_contribution",
+                                             "rec_conn_pax", "rec_conn_revenue", "rec_beyond_revenue"]].copy()
+        fl = feed.melt(id_vars="sector", value_vars=["rec_contribution", "rec_network_contribution"],
+                       var_name="view", value_name="v")
+        fl["view"] = fl["view"].map({"rec_contribution": "Sector contribution",
+                                     "rec_network_contribution": "Network contribution"})
+        fl["₹ Cr"] = fl["v"] / 1e7
+        order = feed.sort_values("rec_network_contribution", ascending=False)["sector"].tolist()
+        bars = alt.Chart(fl).mark_bar(cornerRadiusEnd=4).encode(
+            y=alt.Y("sector:N", sort=order, title=None),
+            yOffset=alt.YOffset("view:N", sort=["Sector contribution", "Network contribution"]),
+            x=alt.X("₹ Cr:Q", title="Full-year contribution (₹ Cr)"),
+            color=alt.Color("view:N", title=None, legend=alt.Legend(orient="top"),
+                            scale=alt.Scale(domain=["Sector contribution", "Network contribution"],
+                                            range=[BASE, REC])),
+            tooltip=["sector", "view", alt.Tooltip("₹ Cr:Q", format=",.1f")])
+        st.altair_chart((bars + alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(color="#8a8985").encode(x="x:Q"))
+                        .properties(height=46 * len(order) + 40), width="stretch")
+        for c in ["rec_contribution", "rec_network_contribution", "rec_conn_revenue", "rec_beyond_revenue"]:
+            feed[c] = feed[c] / 1e7
+        st.dataframe(feed.sort_values("rec_network_contribution", ascending=False), hide_index=True,
+                     width="stretch", column_config={
+                         "market": "Market", "sector": "Sector",
+                         "rec_contribution": st.column_config.NumberColumn("Sector contribution ₹Cr", format="%.1f"),
+                         "rec_network_contribution": st.column_config.NumberColumn("Network contribution ₹Cr",
+                                                                                   format="%.1f"),
+                         "rec_conn_pax": st.column_config.NumberColumn("Connecting pax", format="%.0f"),
+                         "rec_conn_revenue": st.column_config.NumberColumn("Own share of connecting ₹Cr",
+                                                                           format="%.1f"),
+                         "rec_beyond_revenue": st.column_config.NumberColumn("Beyond revenue fed ₹Cr",
+                                                                             format="%.1f")})
+
+        st.subheader("Connecting O&Ds")
+        yr = odf[odf["month"] == "FULL YEAR"].copy()
+        for c in ["ly_revenue", "rec_revenue"]:
+            yr[c] = yr[c] / 1e7
+        st.dataframe(yr[["od", "path", "ly_pax", "demand", "base_pax", "rec_pax", "lost_pax_vs_demand",
+                         "ly_revenue", "rec_revenue"]], hide_index=True, width="stretch", column_config={
+            "od": "O&D", "path": "Path",
+            "ly_pax": st.column_config.NumberColumn("LY pax", format="%.0f"),
+            "demand": st.column_config.NumberColumn("Demand", format="%.0f"),
+            "base_pax": st.column_config.NumberColumn("Pax @ LY schedule", format="%.0f"),
+            "rec_pax": st.column_config.NumberColumn("Pax @ recommended", format="%.0f"),
+            "lost_pax_vs_demand": st.column_config.NumberColumn("Lost vs demand", format="%.0f"),
+            "ly_revenue": st.column_config.NumberColumn("LY ₹Cr", format="%.1f"),
+            "rec_revenue": st.column_config.NumberColumn("Recommended ₹Cr", format="%.1f")})
+        with st.expander("By month (with the weakest leg holding each O&D back)"):
+            mo = odf[odf["month"] != "FULL YEAR"].copy()
+            mo["month"] = mo["month"].map(lambda m: MONTHS[int(m) - 1])
+            st.dataframe(mo, hide_index=True, width="stretch")
+
+# -------------------------------------------------------------- New routes tab
+with tabs[5]:
     nrs = res.get("new_routes")
     if nrs is None or nrs.empty:
         st.info("No new routes in this run. Upload a new-routes file in the sidebar (template available) "
@@ -470,7 +544,7 @@ with tabs[4]:
                          "rec_launch_cost": st.column_config.NumberColumn("Launch cost ₹", format="%.0f")})
 
 # ------------------------------------------------------------------- ATF tab
-with tabs[5]:
+with tabs[6]:
     if "atf_summary" not in res:
         st.info("Add ATF scenarios in the sidebar (Cost section) to see fuel-price sensitivity.")
     else:
@@ -498,7 +572,7 @@ with tabs[5]:
         st.dataframe(view, hide_index=True, width="stretch")
 
 # -------------------------------------------------------------- Download tab
-with tabs[6]:
+with tabs[7]:
     st.subheader("Export")
     st.download_button("⬇ Full results workbook (.xlsx)", to_excel_bytes(res), "network_plan.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")

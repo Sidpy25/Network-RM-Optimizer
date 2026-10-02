@@ -4,6 +4,7 @@
     python -m network_rm_optimizer optimise --history sample_data/history_ly.csv \
         --costs sample_data/cost_forecast.csv --fleet sample_data/fleet.csv \
         --constraints sample_data/constraints.csv --new-routes sample_data/new_routes.csv \
+        --od sample_data/od_connecting.csv \
         --out results/network_plan.xlsx
 """
 from __future__ import annotations
@@ -38,6 +39,7 @@ def main(argv=None) -> int:
     o.add_argument("--fleet", help="fleet_type, aircraft, block_hours_per_day [, seats]")
     o.add_argument("--constraints", help="sector min/max/must-operate/fixed frequencies")
     o.add_argument("--new-routes", help="candidate sectors not flown last year (csv/xlsx)")
+    o.add_argument("--od", help="last year's connecting O&D traffic (csv/xlsx)")
     o.add_argument("--config", help="JSON file with OptimizerConfig overrides")
     o.add_argument("--objective", choices=["contribution", "profit"])
     o.add_argument("--target-year", type=int)
@@ -87,7 +89,7 @@ def main(argv=None) -> int:
     cfg = OptimizerConfig(**overrides)
 
     res = run(a.history, a.costs, a.fleet, a.constraints, cfg, scenarios=not a.no_scenarios,
-              new_routes=a.new_routes)
+              new_routes=a.new_routes, od=a.od)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     write_excel(res, a.out)
 
@@ -129,6 +131,12 @@ def main(argv=None) -> int:
         print("\nNew-route demand scenarios (decision at each demand scale):")
         print(ns[["market", "route"] + [c for c in ns.columns if c.startswith("x")] + ["verdict"]]
               .to_string(index=False))
+    if "od_flows" in res:
+        o_ = res["od_flows"]
+        o_ = o_[o_["month"] == "FULL YEAR"]
+        print("\nConnecting O&Ds (full year):")
+        print(o_.assign(rec_revenue_cr=o_.rec_revenue / 1e7)[["od", "path", "ly_pax", "rec_pax", "rec_revenue_cr"]]
+              .round(1).to_string(index=False))
     sa = res["sector_annual"]
     print("\nSector plan (full-year average weekly frequency):")
     print(sa[["market", "sector", "ly_avg_weekly", "rec_avg_weekly", "months_operated"]]
