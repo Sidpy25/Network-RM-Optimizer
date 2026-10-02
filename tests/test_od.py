@@ -130,3 +130,45 @@ def test_new_connection_needs_its_new_route(sample):
     o = res["od_flows"]
     via = o[(o["month"] != "FULL YEAR") & o["path"].str.contains("BLR-DXB|DXB-BLR")]
     assert len(via) and (via["rec_pax"] < 1e-6).all()
+
+
+# ---- nonstop cannibalisation --------------------------------------------------
+
+@pytest.fixture(scope="module")
+def with_new(sample):
+    cfg = OptimizerConfig(atf_scenarios=(), new_route_demand_scenarios=())
+    kw = dict(history=sample["history"], cost_forecast=sample["costs"], fleet=sample["fleet"],
+              constraints=sample["constraints"], config=cfg, scenarios=False, new_routes=sample["new_routes"])
+    od = pd.read_csv(sample["od"])
+    return run(**kw, od=od), run(**kw, od=od.assign(nonstop_capture=0.0))
+
+
+def test_load_factor_never_exceeds_100pct(with_new):
+    for res in with_new:
+        assert res["plan"]["rec_load_factor"].max() <= 1 + 1e-6
+
+
+def test_new_nonstop_captures_existing_connection(with_new):
+    res, _ = with_new
+    o = res["od_flows"]
+    o = o[o["month"] != "FULL YEAR"]
+    via_bom = o[o["path"] == "BLR-BOM > BOM-DXB"].set_index("month")
+    assert (via_bom["nonstop"] == "BLR-DXB").all()
+    # Before BLR-DXB starts (April) nothing is captured; afterwards a share is.
+    assert (via_bom.loc[[1, 2, 3], "captured_by_nonstop_pax"] == 0).all()
+    assert (via_bom.loc[4:, "captured_by_nonstop_pax"] > 0).all()
+    assert (via_bom["rec_pax"] <= via_bom["demand"] * (1 - via_bom["captured_share"])
+            * (1 + 1e-6) + 1e-6).all()
+    # Connections whose city pair has no new nonstop are untouched.
+    assert (o.loc[o["nonstop"] == "", "captured_by_nonstop_pax"] == 0).all()
+    disp = res["new_routes"].set_index("sector")["displaced_conn_revenue"]
+    assert disp["BLR-DXB"] > 0 and disp["DEL-IXB"] == 0
+
+
+def test_capture_override_and_monotonic_profit(with_new):
+    res, no_capture = with_new
+    o = no_capture["od_flows"]
+    assert (o["captured_by_nonstop_pax"] == 0).all()
+    # Cannibalisation can only cost the network money.
+    assert (no_capture["network_summary"].iloc[-1]["rec_net_profit"]
+            >= res["network_summary"].iloc[-1]["rec_net_profit"] - 1e-3)

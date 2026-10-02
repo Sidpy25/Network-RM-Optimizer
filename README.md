@@ -146,6 +146,21 @@ connections:
 * scale with the new-route demand scenarios,
 * don't fly in the "LY schedule at new cost" baseline.
 
+**Nonstop cannibalisation.** A new route between an existing connection's
+origin and final destination (e.g. new BLR-DXB vs BLR-BOM-DXB) takes part of
+that connection's demand. The connection's ceiling becomes
+`demand × (1 − capture share)`, where
+`capture share = nonstop_capture_rate × (nonstop freq / its ref freq) ^ nonstop_capture_elasticity`
+(defaults 0.6 and 0.5, capped at 1; per-O&D override with a `nonstop_capture`
+column in the O&D file). Nothing is captured before the nonstop starts or
+when it isn't flown. Because this sits inside the optimiser, the launch test
+values a nonstop *net* of the connecting revenue it takes from your own
+network. The new route's own demand estimate should already include the
+passengers it wins from connections; they are taken off the connection, not
+added to the nonstop. Reported as `nonstop`, `captured_by_nonstop_pax` and
+`displaced_revenue` per O&D, and `displaced_conn_revenue` per new route
+(deducted from `network_net_after_launch`).
+
 The new-routes summary adds `rec_beyond_revenue` (revenue its connecting
 passengers bring on other legs) and `network_net_after_launch`. O&D rows
 whose legs are neither flown last year nor in the new-routes file are skipped
@@ -230,7 +245,7 @@ Then:
 
 ## Key parameters (`OptimizerConfig`, CLI flags or `--config params.json`)
 `objective`, `demand_growth`, `fare_growth`, `market_demand_growth`,
-`market_fare_growth`, `frequency_elasticity`, `market_frequency_elasticity`, `connecting_frequency_elasticity`,
+`market_fare_growth`, `frequency_elasticity`, `market_frequency_elasticity`, `connecting_frequency_elasticity`, `nonstop_capture_rate`, `nonstop_capture_elasticity`,
 `fare_capacity_elasticity`, `demand_cv`, `variable_cost_share`, `fuel_share`,
 `min_weekly_if_operated`, `max_weekly_multiplier`, `pair_directions`,
 `new_route_ramp_months`, `new_route_ramp_start`, `new_route_demand_scenarios`,
@@ -245,9 +260,9 @@ Then:
 * O&D effects need the O&D file. The split of seats between local and
   connecting traffic is fixed at last year's mix (no re-optimisation of RM
   controls between the two). Connecting pax who lose their connection are
-  assumed lost (no recapture on another path). A new nonstop doesn't take
-  traffic from existing connections on the same O&D (e.g. BLR-DXB nonstop vs
-  BLR-BOM-DXB): reduce those O&Ds' pax yourself if you expect that.
+  assumed lost (no recapture on another path). Cannibalisation is modelled
+  only for *new* nonstops. A nonstop flown last year already coexisted with
+  its connections, so changing its frequency doesn't shift share between them.
   O&D "demand" is stated at the reference frequency, so flows can exceed it
   when legs fly more often than that.
 * The ±1/wk marginal columns value local traffic only; connecting effects of a

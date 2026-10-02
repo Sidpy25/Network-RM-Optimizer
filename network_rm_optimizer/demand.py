@@ -188,5 +188,5 @@ def build_options(base: pd.DataFrame, config: OptimizerConfig, cons: pd.DataFram
             freqs.append(f)
     rows = base.loc[idx]
     res = evaluate(rows, freqs, config, cost_multiplier)
-    keys = rows[["sector", "month", "market", "fleet_type", "is_new", "launch_cost"]]
+    keys = rows[["sector", "month", "market", "fleet_type", "is_new", "launch_cost", "ref_weekly_freq"]]
     return pd.concat([keys, res], axis=1).reset_index().rename(columns={"index": "base_idx"})

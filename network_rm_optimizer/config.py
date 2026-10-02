@@ -67,6 +67,13 @@ class OptimizerConfig:
     # weakest leg. Higher than local: fewer flights mean fewer workable
     # connections as well as less choice.
     connecting_frequency_elasticity: float = 0.8
+    # Nonstop cannibalisation: when a NEW route flies the same city pair as an
+    # existing connection (e.g. new BLR-DXB vs BLR-BOM-DXB), this share of the
+    # connection's demand switches to the nonstop when the nonstop flies at its
+    # reference frequency (per-O&D override: nonstop_capture column in the O&D
+    # file). The share scales with (nonstop freq / ref) ^ elasticity, capped at 1.
+    nonstop_capture_rate: float = 0.6
+    nonstop_capture_elasticity: float = 0.5
 
     # --- New routes ----------------------------------------------------------
     # Demand in launch month = ramp_start x mature demand, rising linearly to

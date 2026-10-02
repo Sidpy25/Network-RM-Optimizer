@@ -106,6 +106,10 @@ with st.sidebar.expander("Demand & fare model"):
                         help="% demand change per 1% frequency change. ~0.3 thin/monopoly, 0.6-0.9 competitive.")
     conn_el = st.slider("Connecting frequency elasticity", 0.0, 2.0, d.connecting_frequency_elasticity, 0.05,
                         help="% change in a connecting O&D's demand per 1% frequency change on its weakest leg.")
+    capture = st.slider("Nonstop capture rate", 0.0, 1.0, d.nonstop_capture_rate, 0.05,
+                        help="Share of an existing connection's passengers who switch to a new nonstop on the same "
+                             "city pair when it flies at its reference frequency (per-O&D override: "
+                             "nonstop_capture column).")
     fare_el = st.slider("Fare-capacity elasticity", 0.0, 0.5, d.fare_capacity_elasticity, 0.01,
                         help="% fare fall per 1% more seats (RM opens cheaper buckets).")
     cv = st.slider("Demand variability (CV)", 0.1, 0.6, d.demand_cv, 0.05,
@@ -172,7 +176,7 @@ except ValueError:
 cfg = dict(
     target_year=int(target_year), objective=objective, demand_cv=cv,
     frequency_elasticity=freq_el, fare_capacity_elasticity=fare_el,
-    connecting_frequency_elasticity=conn_el,
+    connecting_frequency_elasticity=conn_el, nonstop_capture_rate=capture,
     demand_growth=demand_growth, fare_growth=fare_growth,
     market_demand_growth=_overrides("demand_growth_pct", 100),
     market_fare_growth=_overrides("fare_change_pct", 100),
@@ -456,18 +460,22 @@ with tabs[4]:
 
         st.subheader("Connecting O&Ds")
         yr = odf[odf["month"] == "FULL YEAR"].copy()
-        for c in ["ly_revenue", "rec_revenue"]:
+        for c in ["ly_revenue", "rec_revenue", "displaced_revenue"]:
             yr[c] = yr[c] / 1e7
         yr["new_connection"] = yr["new_connection"].map({True: "🆕 via new route", False: ""})
         st.dataframe(yr.sort_values(["new_connection", "rec_revenue"], ascending=[False, False])[
             ["od", "path", "new_connection", "ly_pax", "demand", "base_pax", "rec_pax", "lost_pax_vs_demand",
-             "ly_revenue", "rec_revenue"]], hide_index=True, width="stretch", column_config={
+             "nonstop", "captured_by_nonstop_pax", "displaced_revenue", "ly_revenue", "rec_revenue"]],
+            hide_index=True, width="stretch", column_config={
             "od": "O&D", "path": "Path", "new_connection": "New?",
             "ly_pax": st.column_config.NumberColumn("LY pax", format="%.0f"),
             "demand": st.column_config.NumberColumn("Demand @ ref. frequency", format="%.0f"),
             "base_pax": st.column_config.NumberColumn("Pax @ LY schedule", format="%.0f"),
             "rec_pax": st.column_config.NumberColumn("Pax @ recommended", format="%.0f"),
             "lost_pax_vs_demand": st.column_config.NumberColumn("Below demand (− = above)", format="%.0f"),
+            "nonstop": "New nonstop on same pair",
+            "captured_by_nonstop_pax": st.column_config.NumberColumn("Pax switching to nonstop", format="%.0f"),
+            "displaced_revenue": st.column_config.NumberColumn("Connecting revenue displaced ₹Cr", format="%.1f"),
             "ly_revenue": st.column_config.NumberColumn("LY ₹Cr", format="%.1f"),
             "rec_revenue": st.column_config.NumberColumn("Recommended ₹Cr", format="%.1f")})
         with st.expander("By month (with the weakest leg holding each O&D back)"):
@@ -491,7 +499,7 @@ with tabs[5]:
         v["decision"] = v["decision"].map({"LAUNCH": "✅ LAUNCH", "NOT LAUNCHED": "⛔ NOT LAUNCHED"})
         v["start_month"] = v["start_month"].map(lambda m: MONTHS[int(m) - 1])
         for c in ["rec_revenue", "rec_total_cost", "rec_contribution", "launch_cost", "first_year_net_after_launch",
-                  "rec_beyond_revenue", "network_net_after_launch"]:
+                  "rec_beyond_revenue", "displaced_conn_revenue", "network_net_after_launch"]:
             v[c] = v[c] / 1e7
         st.dataframe(v.drop(columns=["rec_launch_cost", "rec_pax"]), hide_index=True, width="stretch",
                      column_config={
@@ -507,6 +515,8 @@ with tabs[5]:
                          "rec_conn_pax": st.column_config.NumberColumn("Connecting pax", format="%.0f"),
                          "rec_beyond_revenue": st.column_config.NumberColumn("Beyond revenue fed ₹Cr",
                                                                              format="%.2f"),
+                         "displaced_conn_revenue": st.column_config.NumberColumn(
+                             "Own connections displaced ₹Cr", format="%.2f"),
                          "network_net_after_launch": st.column_config.NumberColumn(
                              "Network value after launch ₹Cr", format="%.2f"),
                          "load_factor": st.column_config.NumberColumn("LF", format="percent")})

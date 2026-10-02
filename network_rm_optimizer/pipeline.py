@@ -7,7 +7,7 @@ import pandas as pd
 from .config import OptimizerConfig
 from .data import load_constraints, load_fleet, prepare_costs, prepare_history, prepare_new_routes
 from .demand import calibrate, evaluate, frequency_options
-from .od import allocate_flows, finalize_od, od_demand, parse_od, split_local
+from .od import allocate_flows, capture_share, finalize_od, od_demand, parse_od, split_local
 from .optimizer import fleet_capacity, optimise_full
 
 METRICS = ["departures", "seats", "ask", "pax", "revenue", "variable_cost", "total_cost",
@@ -201,7 +201,8 @@ def sector_annual(plan: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
     return s.sort_values(f"rec_{config.objective}", ascending=False)
 
 
-def new_route_summary(plan: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
+def new_route_summary(plan: pd.DataFrame, config: OptimizerConfig,
+                      od_sum: pd.DataFrame | None = None) -> pd.DataFrame:
     """One row per new sector: launch decision and first-year economics."""
     n = plan[plan["is_new"]]
     if n.empty:
@@ -221,11 +222,19 @@ def new_route_summary(plan: pd.DataFrame, config: OptimizerConfig) -> pd.DataFra
     g["decision"] = np.where(g["months_operated"] > 0, "LAUNCH", "NOT LAUNCHED")
     g["load_factor"] = np.where(g["rec_seats"] > 0, g["rec_pax"] / g["rec_seats"].where(g["rec_seats"] > 0), np.nan)
     g["first_year_net_after_launch"] = g["rec_contribution"] - g["rec_launch_cost"]
-    # Including revenue its connecting passengers bring on other legs.
-    g["network_net_after_launch"] = g["first_year_net_after_launch"] + g["rec_beyond_revenue"]
+    # Connecting revenue our own existing connections lose to this nonstop.
+    g["displaced_conn_revenue"] = 0.0
+    if od_sum is not None and len(od_sum):
+        disp = od_sum[od_sum["month"] != "FULL YEAR"].groupby("nonstop")["displaced_revenue"].sum()
+        g["displaced_conn_revenue"] = g["sector"].map(disp).fillna(0.0)
+    # Including revenue its connecting passengers bring on other legs, net of
+    # what it takes from existing connections.
+    g["network_net_after_launch"] = (g["first_year_net_after_launch"] + g["rec_beyond_revenue"]
+                                     - g["displaced_conn_revenue"])
     return g[["market", "sector", "decision", "start_month", "months_operated", "avg_weekly_when_flown",
               "rec_revenue", "rec_total_cost", "rec_contribution", "launch_cost", "rec_launch_cost",
-              "first_year_net_after_launch", "rec_conn_pax", "rec_beyond_revenue", "network_net_after_launch",
+              "first_year_net_after_launch", "rec_conn_pax", "rec_beyond_revenue", "displaced_conn_revenue",
+              "network_net_after_launch",
               "load_factor", "rec_pax"]].sort_values(
         "first_year_net_after_launch", ascending=False)
 
@@ -259,21 +268,31 @@ def od_summary(od: pd.DataFrame, flows: pd.DataFrame, base_fl: pd.DataFrame, pla
                  ** config.connecting_frequency_elasticity for leg in r.leg_list}
         weakest = min(mults, key=mults.get)
         rp = float(rec.get(r.od_id, 0.0))
+        bp = float(bas.get(r.od_id, 0.0))
+        share = 0.0
+        if r.nonstop:
+            share = float(capture_share([w.at[(r.nonstop, r.month), "rec_weekly_freq"]],
+                                        [w.at[(r.nonstop, r.month), "ref_weekly_freq"]], r.capture_rate, config)[0])
+        captured = r.demand * share
         rows.append({"month": r.month, "od": r.od, "path": r.path,
                      "new_connection": bool(r.is_new_od), "ly_pax": r.pax, "ly_revenue": r.revenue,
-                     "demand": r.demand, "base_pax": float(bas.get(r.od_id, 0.0)), "rec_pax": rp,
+                     "demand": r.demand, "base_pax": bp, "rec_pax": rp,
                      "fare": r.plan_fare, "rec_revenue": rp * r.plan_fare,
                      "lost_pax_vs_demand": r.demand - rp,
+                     "nonstop": r.nonstop, "captured_share": share, "captured_by_nonstop_pax": captured,
+                     # Revenue the connection loses to our own nonstop (vs flying LY's schedule).
+                     "displaced_revenue": min(captured, bp) * r.plan_fare,
                      "weakest_leg": weakest if mults[weakest] < 0.999 else "",
                      "weakest_leg_freq_ratio": mults[weakest] ** (1 / config.connecting_frequency_elasticity)})
     m = pd.DataFrame(rows)
-    yr = m.groupby(["od", "path", "new_connection"], as_index=False)[["ly_pax", "ly_revenue", "demand", "base_pax", "rec_pax",
-                                                     "rec_revenue", "lost_pax_vs_demand"]].sum()
+    yr = m.groupby(["od", "path", "new_connection", "nonstop"], as_index=False)[
+        ["ly_pax", "ly_revenue", "demand", "base_pax", "rec_pax", "rec_revenue", "lost_pax_vs_demand",
+         "captured_by_nonstop_pax", "displaced_revenue"]].sum()
     yr["month"] = "FULL YEAR"
     return pd.concat([yr, m], ignore_index=True)[
         ["od", "path", "new_connection", "month", "ly_pax", "ly_revenue", "demand", "base_pax", "rec_pax",
-         "rec_revenue",
-         "fare", "lost_pax_vs_demand", "weakest_leg", "weakest_leg_freq_ratio"]]
+         "rec_revenue", "fare", "lost_pax_vs_demand", "nonstop", "captured_share", "captured_by_nonstop_pax",
+         "displaced_revenue", "weakest_leg", "weakest_leg_freq_ratio"]]
 
 
 def run_new_route_demand_scenarios(base, config, fleet, cons, chosen_base, od=None,
@@ -419,7 +438,7 @@ def run(history, cost_forecast, fleet=None, constraints=None,
     if od_d is not None:
         out["od_flows"] = od_summary(od_d, flows, baseline_flows(od_d, base), plan, config)
     if base["is_new"].any():
-        out["new_routes"] = new_route_summary(plan, config)
+        out["new_routes"] = new_route_summary(plan, config, out.get("od_flows"))
         if scenarios and config.new_route_demand_scenarios:
             out["new_route_scenarios"], out["new_route_scenario_summary"] = (
                 run_new_route_demand_scenarios(base, config, fleet_df, cons, chosen, od_d, flows))

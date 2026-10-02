@@ -21,6 +21,9 @@ Model:
     fewer frequencies mean fewer connection options. Connecting pax also need
     seats: the flows on a leg cannot exceed its connecting share of seats.
   * At last year's schedule local + connecting revenue reproduces LY revenue.
+  * Nonstop cannibalisation: if a NEW route flies the O&D's origin to final
+    destination, its demand ceiling becomes demand x (1 - capture share), where
+    the share = capture_rate x (nonstop freq / ref) ^ elasticity, capped at 1.
   * New connections: O&D rows that use a new route carry an *estimate* of
     demand (at the new route's reference frequency) instead of LY pax. They
     ramp up with the new route and fill seats local traffic leaves empty on
@@ -102,7 +105,7 @@ def finalize_od(od: pd.DataFrame, base: pd.DataFrame, config: OptimizerConfig,
         od = pd.concat([od[~month_blank], pd.DataFrame(exp)], ignore_index=True)
     if len(od) == 0:
         return pd.DataFrame(columns=["od_id", "month", "od", "path", "leg_list", "shares", "is_new_od", "pax",
-                                     "revenue", "fare", "est_pax", "ramp"])
+                                     "revenue", "fare", "est_pax", "ramp", "nonstop", "capture_rate"])
     od["month"] = _parse_month(od["month"])
     if "pax" not in od.columns:
         raise ValueError("od file is missing required column 'pax'")
@@ -126,13 +129,19 @@ def finalize_od(od: pd.DataFrame, base: pd.DataFrame, config: OptimizerConfig,
     # New connections: estimate goes to est_pax; LY actuals are zero.
     od["est_pax"] = np.where(od["is_new_od"], od["pax"], np.nan)
     od.loc[od["is_new_od"], ["pax", "revenue"]] = 0.0
+    # Nonstop cannibalisation: a NEW route between the O&D's origin and final
+    # destination takes a share of this connection's demand when flown.
+    ends = od["leg_list"].map(lambda L: f"{L[0].split('-')[0]}-{L[-1].split('-')[-1]}")
+    od["nonstop"] = [e if e in new_sectors and e not in L else "" for e, L in zip(ends, od["leg_list"])]
+    rate = od["nonstop_capture"] if "nonstop_capture" in od.columns else pd.Series(np.nan, index=od.index)
+    od["capture_rate"] = rate.astype(float).fillna(config.nonstop_capture_rate).clip(0.0, 1.0)
     ramp = base.set_index(["sector", "month"])["ramp"]
     od["ramp"] = [min((ramp[(leg, m)] for leg in L if leg in new_sectors), default=1.0)
                   for L, m in zip(od["leg_list"], od["month"])]
     od = od.reset_index(drop=True)
     od["od_id"] = od.index
     return od[["od_id", "month", "od", "path", "leg_list", "shares", "is_new_od", "pax", "revenue", "fare",
-               "est_pax", "ramp"]]
+               "est_pax", "ramp", "nonstop", "capture_rate"]]
 
 
 def load_od(path_or_df, base: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
@@ -141,6 +150,13 @@ def load_od(path_or_df, base: pd.DataFrame, config: OptimizerConfig) -> pd.DataF
     if "ramp" not in b.columns:
         b = b.assign(ramp=1.0)
     return finalize_od(parse_od(path_or_df), b, config)
+
+
+def capture_share(weekly, ref_weekly, rate, config: OptimizerConfig):
+    """Share of a connection's demand captured by a nonstop flying `weekly` per week."""
+    weekly = np.asarray(weekly, dtype=float)
+    ratio = np.divide(weekly, ref_weekly, out=np.zeros_like(weekly), where=np.asarray(ref_weekly) > 0)
+    return np.minimum(1.0, rate * np.power(ratio, config.nonstop_capture_elasticity))
 
 
 def leg_rows(od: pd.DataFrame) -> pd.DataFrame:

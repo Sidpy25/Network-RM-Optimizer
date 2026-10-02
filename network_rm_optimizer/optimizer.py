@@ -25,6 +25,7 @@ import pulp
 from .config import OptimizerConfig
 from .data import reverse_sector
 from .demand import build_options
+from .od import capture_share
 
 
 @dataclass
@@ -83,6 +84,11 @@ def _solve_block(opts: pd.DataFrame, base_b: pd.DataFrame, cap_b: pd.DataFrame,
                     has_new.add((leg, r.month))
                 else:
                     existing.setdefault((leg, r.month), []).append(v)
+            if r.nonstop:
+                # A new nonstop on the same city pair takes a share of this demand.
+                ns = opts[(opts["sector"] == r.nonstop) & (opts["month"] == r.month)]
+                share = capture_share(ns["weekly_freq"], ns["ref_weekly_freq"], r.capture_rate, config)
+                prob += v <= r.demand * (1 - pulp.lpSum(sh * x[i] for i, sh in zip(ns.index, share)))
         for (leg, m), vs in existing.items():
             # LY connecting traffic keeps its LY share of seats.
             lo = opts[(opts["sector"] == leg) & (opts["month"] == m)]
