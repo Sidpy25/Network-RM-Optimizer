@@ -205,20 +205,34 @@ cfg = dict(
 )
 run_scen = bool(atf) or bool(nr_scen)
 
+
+def inputs_signature(*frames) -> tuple:
+    """Fingerprint of the input data, to tell when results are stale."""
+    return tuple(None if f is None else (f.shape, int(pd.util.hash_pandas_object(f, index=False).sum()))
+                 for f in frames)
+
+
+inputs = (history, costs, fleet, constraints, new_routes, od, disruptions)
+
 if st.sidebar.button("▶ Run optimiser", type="primary", width="stretch") or "res" not in st.session_state:
     with st.spinner("Calibrating demand and solving the network…"):
         try:
             st.session_state.res, st.session_state.msgs = optimise(
                 history, costs, fleet, constraints, new_routes, od, disruptions, cfg, run_scen)
             st.session_state.cfg = cfg
+            st.session_state.inputs_sig = inputs_signature(*inputs)
         except Exception as e:  # show input / infeasibility problems to the user
             st.session_state.pop("res", None)
             st.error(f"Could not optimise: {e}")
             st.stop()
 
 res, msgs = st.session_state.res, st.session_state.msgs
-if st.session_state.get("cfg") != cfg:
-    st.warning("Assumptions changed since the last run. Press **Run optimiser** to update.")
+stale = [what for what, changed in (("assumptions", st.session_state.get("cfg") != cfg),
+                                    ("input data", st.session_state.get("inputs_sig") != inputs_signature(*inputs)))
+         if changed]
+if stale:
+    st.warning(f"The {' and '.join(stale)} changed since the last run - the results below are out of date. "
+               "Press **Run optimiser** to update.")
 for m in msgs:
     st.warning(m)
 

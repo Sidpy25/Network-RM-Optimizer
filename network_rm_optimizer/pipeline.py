@@ -97,7 +97,7 @@ def baseline_flows(od: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
     pax = pax.where(~od["is_new_od"].astype(bool), 0.0)  # new routes are not in last year's schedule
     closed = base.set_index(["sector", "month"])["closed"].astype(bool)
     dead = [any(closed.get((leg, m), False) for leg in L) for L, m in zip(od["leg_list"], od["month"])]
-    pax = pax.where(~np.asarray(dead), 0.0)  # a closed leg kills the connection
+    pax = pax.where(~np.asarray(dead, dtype=bool), 0.0)  # a closed leg kills the connection
     return pd.DataFrame({"od_id": od["od_id"], "month": od["month"], "pax": pax, "fare": od["plan_fare"]})
 
 
@@ -256,8 +256,8 @@ def _flow_revenue(flows: pd.DataFrame | None) -> float:
 def _network_net_profit(ch: pd.DataFrame, base: pd.DataFrame, cost_multiplier: float = 1.0,
                         flows: pd.DataFrame | None = None) -> float:
     """Contribution (incl. connecting revenue) - fixed cost pool - launch costs, for a chosen plan."""
-    cpd = base["new_cost_per_departure"] * (1 + base["fuel_share"] * (cost_multiplier - 1))
-    fixed = ((1 - base["variable_cost_share"]) * cpd * base["ly_departures"]).sum()
+    # Fixed costs are carried whatever is flown; ATF only moves (variable) fuel.
+    fixed = ((1 - base["variable_cost_share"]) * base["new_cost_per_departure"] * base["ly_departures"]).sum()
     launched = ch.loc[ch["weekly_freq"] > 0, ["sector", "launch_cost"]].drop_duplicates("sector")
     return float(ch["contribution"].sum() + _flow_revenue(flows) - fixed - launched["launch_cost"].sum())
 
@@ -270,9 +270,9 @@ def od_summary(od: pd.DataFrame, flows: pd.DataFrame, base_fl: pd.DataFrame, pla
     rec = flows.set_index("od_id")["pax"]
     bas = base_fl.set_index("od_id")["pax"]
     for r in od.itertuples():
-        mults = {leg: (w.at[(leg, r.month), "rec_weekly_freq"] / w.at[(leg, r.month), "ref_weekly_freq"])
-                 ** config.connecting_frequency_elasticity for leg in r.leg_list}
-        weakest = min(mults, key=mults.get)
+        ratios = {leg: w.at[(leg, r.month), "rec_weekly_freq"] / w.at[(leg, r.month), "ref_weekly_freq"]
+                  if w.at[(leg, r.month), "ref_weekly_freq"] > 0 else 0.0 for leg in r.leg_list}
+        weakest = min(ratios, key=ratios.get)
         rp = float(rec.get(r.od_id, 0.0))
         bp = float(bas.get(r.od_id, 0.0))
         share = 0.0
@@ -288,8 +288,8 @@ def od_summary(od: pd.DataFrame, flows: pd.DataFrame, base_fl: pd.DataFrame, pla
                      "nonstop": r.nonstop, "captured_share": share, "captured_by_nonstop_pax": captured,
                      # Revenue the connection loses to our own nonstop (vs flying LY's schedule).
                      "displaced_revenue": min(captured, bp) * r.plan_fare,
-                     "weakest_leg": weakest if mults[weakest] < 0.999 else "",
-                     "weakest_leg_freq_ratio": mults[weakest] ** (1 / config.connecting_frequency_elasticity)})
+                     "weakest_leg": weakest if ratios[weakest] < 0.999 else "",
+                     "weakest_leg_freq_ratio": ratios[weakest]})
     m = pd.DataFrame(rows)
     yr = m.groupby(["od", "path", "new_connection", "nonstop"], as_index=False)[
         ["ly_pax", "ly_revenue", "demand", "base_pax", "rec_pax", "rec_revenue", "lost_pax_vs_demand",
@@ -468,7 +468,7 @@ def run(history, cost_forecast, fleet=None, constraints=None,
     if dis is not None and len(dis):
         base.attrs["fleet_floor_by_month"] = {int(m): config.disruption_min_fleet_utilisation
                                               for m in dis["month"].unique()}
-    od_d = od_demand(od_raw, base, config, dis=dis) if od_raw is not None else None
+    od_d = od_demand(od_raw, base, config, dis=dis) if od_raw is not None and len(od_raw) else None
 
     chosen, flows = optimise_full(base, config, fleet_df, cons, od=od_d)
     plan = build_plan(base, chosen, config, cons, od_d, flows)
@@ -490,7 +490,7 @@ def run(history, cost_forecast, fleet=None, constraints=None,
         "fleet_utilisation": fleet_use,
     }
     if dis is not None and len(dis):
-        od_n = od_demand(od_raw, base_normal, config) if od_raw is not None else None
+        od_n = od_demand(od_raw, base_normal, config) if od_d is not None else None
         ch_n, fl_n = optimise_full(base_normal, config, fleet_df, cons, od=od_n)
         plan_n = build_plan(base_normal, ch_n, config, cons, od_n, fl_n)
         out["disruption_impact"], out["disruption_summary"] = disruption_impact(plan_n, plan)

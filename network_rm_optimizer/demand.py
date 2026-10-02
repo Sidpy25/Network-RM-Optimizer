@@ -124,9 +124,12 @@ def evaluate(rows: pd.DataFrame, weekly, config: OptimizerConfig, cost_multiplie
     pax = expected_sales(mu, config.demand_cv, seats * local_share)
     revenue = pax * fare
 
-    cpd = r["new_cost_per_departure"].to_numpy() * (1 + r["fuel_share"].to_numpy() * (np.asarray(cost_multiplier) - 1))
+    # ATF scenarios move only the fuel part of cost, and fuel is fully variable.
+    cpd0 = r["new_cost_per_departure"].to_numpy()
+    fuel_delta = cpd0 * r["fuel_share"].to_numpy() * (np.asarray(cost_multiplier) - 1)
+    cpd = cpd0 + fuel_delta
     total_cost = deps * cpd
-    variable_cost = total_cost * r["variable_cost_share"].to_numpy()
+    variable_cost = deps * (cpd0 * r["variable_cost_share"].to_numpy() + fuel_delta)
     ask = seats * r["distance_km"].to_numpy()
 
     out = pd.DataFrame({
@@ -164,6 +167,7 @@ def frequency_options(row: pd.Series, config: OptimizerConfig, cons: pd.DataFram
     if pd.notna(row.get("max_weekly_override", np.nan)):
         hi = int(row["max_weekly_override"])
     lo = config.min_weekly_if_operated
+    user_min = None
     must, fixed = False, None
     if cons is not None:
         c = cons[(cons["sector"] == row["sector"]) & (cons["month"].isna() | (cons["month"] == row["month"]))]
@@ -171,13 +175,22 @@ def frequency_options(row: pd.Series, config: OptimizerConfig, cons: pd.DataFram
             if pd.notna(cr["fixed_weekly"]):
                 fixed = int(cr["fixed_weekly"])
             if pd.notna(cr["min_weekly"]):
-                lo = max(lo, int(cr["min_weekly"]))
+                user_min = max(user_min or 0, int(cr["min_weekly"]))
                 must = must or cr["min_weekly"] > 0
             if pd.notna(cr["max_weekly"]):
                 hi = int(cr["max_weekly"])
             must = must or bool(cr["must_operate"])
     if fixed is not None:
         return [fixed]
+    if user_min is not None:
+        if user_min > hi:
+            raise ValueError(f"{row['sector']} month {row['month']}: min_weekly {user_min} is above "
+                             f"max_weekly {hi} in the constraints")
+        lo = max(lo, user_min)
+    # An explicit max below the general minimum frequency wins over that minimum.
+    lo = min(lo, hi)
+    if must and hi < 1:
+        raise ValueError(f"{row['sector']} month {row['month']}: must-operate but max_weekly is {hi}")
     opts = list(range(max(lo, 1), hi + 1))
     if not must:
         opts = [0] + opts

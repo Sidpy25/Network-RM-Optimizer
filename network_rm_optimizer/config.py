@@ -121,3 +121,10 @@ class OptimizerConfig:
                 raise ValueError(f"{name} must be between 0 and 1, got {v}")
         if self.demand_cv <= 0:
             raise ValueError("demand_cv must be > 0")
+        for name in ("frequency_elasticity", "fare_capacity_elasticity", "connecting_frequency_elasticity",
+                     "nonstop_capture_elasticity"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0")
+        for name in ("min_fleet_utilisation", "disruption_min_fleet_utilisation", "nonstop_capture_rate"):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be between 0 and 1")

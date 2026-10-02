@@ -103,6 +103,16 @@ def load_fleet(path_or_df) -> pd.DataFrame | None:
     df = _read(path_or_df)
     _require(df, ["fleet_type", "aircraft", "block_hours_per_day"], "fleet")
     df["fleet_type"] = df["fleet_type"].astype(str).str.strip().str.upper()
+    if df["fleet_type"].duplicated().any():
+        # Several rows per type (e.g. owned + leased sub-fleets): sum the aircraft
+        # and keep total block hours (aircraft-weighted average utilisation).
+        df = df.assign(_bh=df["aircraft"] * df["block_hours_per_day"])
+        agg = {"aircraft": ("aircraft", "sum"), "_bh": ("_bh", "sum")}
+        if "seats" in df.columns:
+            agg["seats"] = ("seats", "first")
+        df = df.groupby("fleet_type", as_index=False).agg(**agg)
+        df["block_hours_per_day"] = df["_bh"] / df["aircraft"]
+        df = df.drop(columns="_bh")
     return df
 
 
@@ -288,8 +298,9 @@ def prepare_new_routes(path_or_df, base: pd.DataFrame, config: OptimizerConfig,
     else:
         nr["proxy_sector"] = None
 
-    # Mirror rows for the return direction (launch cost stays on the listed row).
-    listed = set(nr["sector"])
+    # Mirror rows for the return direction (launch cost stays on the listed row),
+    # unless that direction is already listed or was flown last year.
+    listed = set(nr["sector"]) | set(base["sector"])
     rev = nr[(nr["both_directions"] == 1) & ~nr["sector"].map(reverse_sector).isin(listed)].copy()
     if len(rev):
         rev["sector"] = rev["sector"].map(reverse_sector)
@@ -389,7 +400,12 @@ def load_constraints(path_or_df) -> pd.DataFrame | None:
         return None
     df = _normalise_sector(_read(path_or_df))
     if "month" in df.columns:
-        df["month"] = pd.to_numeric(df["month"], errors="coerce")
+        # Same month formats as every other input (1-12, "YYYY-MM", dates); blank = all months.
+        given = df["month"].notna() & (df["month"].astype(str).str.strip() != "")
+        months = pd.Series(np.nan, index=df.index)
+        if given.any():
+            months[given] = _parse_month(df.loc[given, "month"]).astype(float)
+        df["month"] = months
     else:
         df["month"] = np.nan
     for col in ("min_weekly", "max_weekly", "fixed_weekly"):

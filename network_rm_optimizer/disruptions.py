@@ -121,9 +121,12 @@ def airport_caps(dis: pd.DataFrame | None, base: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
     days = base.groupby("month")["days_in_month"].first()
     c = c.assign(days=c["month"].map(days)).dropna(subset=["days"])
-    return pd.DataFrame({"month": c["month"], "airport": c["value"],
+    caps = pd.DataFrame({"month": c["month"], "airport": c["value"],
                          "max_departures": c["max_daily_departures"] * c["days"],
                          "max_movements": c["max_daily_movements"] * c["days"]})
+    # Several rows for the same airport-month (e.g. a month-specific and an
+    # all-year cap): the tightest applies. min() skips blanks.
+    return caps.groupby(["month", "airport"], as_index=False)[["max_departures", "max_movements"]].min()
 
 
 def od_multipliers(od: pd.DataFrame, dis: pd.DataFrame | None, base: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:

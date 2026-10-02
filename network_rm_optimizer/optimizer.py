@@ -120,7 +120,9 @@ def _solve_block(opts: pd.DataFrame, base_b: pd.DataFrame, cap_b: pd.DataFrame,
     for m in months:
         om = opts[opts["month"] == m]
         if config.pair_directions:
-            sectors = set(om["sector"])
+            # A direction closed by a disruption can't fly; don't force its reverse to 0 too.
+            closed = set(base_b.loc[(base_b["month"] == m) & base_b["closed"].astype(bool), "sector"])
+            sectors = set(om["sector"]) - closed
             done = set()
             for s in sectors:
                 r = reverse_sector(s)
