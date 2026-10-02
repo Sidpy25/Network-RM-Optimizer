@@ -12,6 +12,9 @@ from dataclasses import asdict, dataclass, field
 class OptimizerConfig:
     # Year being planned (used for days-in-month).
     target_year: int = 2026
+    # Months to plan (empty = all 12). Use e.g. (11,) to re-plan just next
+    # month after a NOTAM or demand shock - much faster.
+    plan_months: tuple = ()
 
     # "contribution" = revenue - variable cost. Fixed costs (ownership, overheads)
     #                  are sunk in the planning year, so maximising contribution
@@ -95,6 +98,10 @@ class OptimizerConfig:
     # aircraft are paid for, so the question is where to fly them, not whether).
     # Set to 0 to allow the optimiser to ground aircraft.
     min_fleet_utilisation: float = 0.90
+    # Fleet utilisation floor in months hit by a disruption. Default 0: a
+    # closure or demand shock should not force freed aircraft onto loss-making
+    # flying - park them, wet-lease them out or use them for maintenance.
+    disruption_min_fleet_utilisation: float = 0.0
 
     # --- ATF scenarios ------------------------------------------------------
     # Multipliers on the ATF price relative to the cost estimate.

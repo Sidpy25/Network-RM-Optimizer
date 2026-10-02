@@ -195,7 +195,7 @@ def split_local(base: pd.DataFrame, od: pd.DataFrame | None) -> pd.DataFrame:
 
 
 def od_demand(od: pd.DataFrame, base: pd.DataFrame, config: OptimizerConfig,
-              new_scale: float = 1.0) -> pd.DataFrame:
+              new_scale: float = 1.0, dis: pd.DataFrame | None = None) -> pd.DataFrame:
     """Planning-year O&D demand and fare.
 
     Existing O&Ds: LY pax x growth (first leg's market). New connections: the
@@ -210,6 +210,11 @@ def od_demand(od: pd.DataFrame, base: pd.DataFrame, config: OptimizerConfig,
     new = d["is_new_od"].astype(bool)
     d["demand"] = np.where(new, d["est_pax"].fillna(0.0) * d["ramp"] * new_scale, d["pax"] * (1 + g))
     d["plan_fare"] = np.where(new, d["fare"].fillna(0.0), d["fare"].fillna(0.0) * (1 + fg))
+    if dis is not None and len(dis):
+        from .disruptions import od_multipliers
+        dm, fm = od_multipliers(d, dis, base)
+        d["demand"] = d["demand"] * dm
+        d["plan_fare"] = d["plan_fare"] * fm
     return d
 
 

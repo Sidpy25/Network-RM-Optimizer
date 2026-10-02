@@ -122,6 +122,7 @@ def generate(out_dir: str, ly_year: int = 2025, seed: int = 7) -> dict[str, str]
         "constraints": os.path.join(out_dir, "constraints.csv"),
         "new_routes": os.path.join(out_dir, "new_routes.csv"),
         "od": os.path.join(out_dir, "od_connecting.csv"),
+        "disruptions": os.path.join(out_dir, "disruptions.csv"),
     }
     h.to_csv(paths["history"], index=False)
     pd.DataFrame(cost).to_csv(paths["costs"], index=False)
@@ -129,4 +130,11 @@ def generate(out_dir: str, ly_year: int = 2025, seed: int = 7) -> dict[str, str]
     cons.to_csv(paths["constraints"], index=False)
     new_routes.to_csv(paths["new_routes"], index=False)
     pd.DataFrame(od_rows).to_csv(paths["od"], index=False)
+    # Example short-notice disruptions for November.
+    pd.DataFrame([
+        {"month": 11, "airport": "GOI", "closed": 1, "note": "Runway NOTAM - airport closed all month"},
+        {"month": 11, "airport": "DXB", "demand_change": -0.30, "note": "Sudden demand drop"},
+        {"month": 11, "airport": "BLR", "max_daily_departures": 8, "note": "Partial NOTAM - night closure"},
+    ], columns=["month", "airport", "sector", "market", "closed", "demand_change", "fare_change",
+                "max_daily_departures", "max_daily_movements", "note"]).to_csv(paths["disruptions"], index=False)
     return paths

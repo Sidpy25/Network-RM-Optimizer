@@ -86,6 +86,10 @@ def calibrate(base: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
     b.loc[old, "ref_weekly_freq"] = b.loc[old, "ly_weekly_freq"]
     b.loc[old, "ref_seats"] = b.loc[old, "ly_seats"]
     b.loc[old, "ref_fare"] = (b.loc[old, "ly_local_revenue"] / local_pax.where(local_pax > 0)).fillna(0.0)
+    # Disruption columns: default "no disruption", also for rows appended later (new routes).
+    for c, v in (("closed", False), ("demand_mult", 1.0), ("fare_mult", 1.0), ("disruption", "")):
+        b[c] = b[c].fillna(v) if c in b.columns else v
+    b["closed"] = b["closed"].astype(bool)
     b["demand_growth"] = b["market"].map(config.market_demand_growth).fillna(config.demand_growth)
     b.loc[~b["growth_applies"], "demand_growth"] = 0.0
     b["fare_growth"] = b["market"].map(config.market_fare_growth).fillna(config.fare_growth)
@@ -111,8 +115,8 @@ def evaluate(rows: pd.DataFrame, weekly, config: OptimizerConfig, cost_multiplie
     ratio_s = np.divide(seats, s0, out=np.zeros_like(weekly), where=s0 > 0)
     with np.errstate(divide="ignore"):
         mu = (r["ref_demand"].to_numpy() * r["ramp"].to_numpy() * (1 + r["demand_growth"].to_numpy())
-              * np.power(ratio_f, r["frequency_elasticity"].to_numpy()))
-        fare = r["ref_fare"].to_numpy() * (1 + r["fare_growth"].to_numpy()) * np.where(
+              * r["demand_mult"].to_numpy() * np.power(ratio_f, r["frequency_elasticity"].to_numpy()))
+        fare = r["ref_fare"].to_numpy() * (1 + r["fare_growth"].to_numpy()) * r["fare_mult"].to_numpy() * np.where(
             ratio_s > 0, np.power(np.where(ratio_s > 0, ratio_s, 1.0), -config.fare_capacity_elasticity), 0.0)
     # Local passengers compete for the local share of seats; the rest are for
     # connecting O&D flows (decided in the optimiser).
@@ -153,6 +157,8 @@ def frequency_options(row: pd.Series, config: OptimizerConfig, cons: pd.DataFram
     """Candidate weekly frequencies for one sector-month."""
     if row["month"] < row["start_month"]:
         return [0]  # new route not yet launched
+    if row.get("closed", False):
+        return [0]  # NOTAM / airport closed: overrides must-operate and minimums
     f0 = row["ref_weekly_freq"]
     hi = int(min(config.max_weekly_cap, max(math.ceil(f0 * config.max_weekly_multiplier), math.ceil(f0) + 7)))
     if pd.notna(row.get("max_weekly_override", np.nan)):

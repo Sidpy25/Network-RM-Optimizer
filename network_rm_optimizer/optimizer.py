@@ -56,7 +56,8 @@ def solve_block(*args, **kwargs) -> SolveResult:
 
 
 def _solve_block(opts: pd.DataFrame, base_b: pd.DataFrame, cap_b: pd.DataFrame,
-                 config: OptimizerConfig, od_b: pd.DataFrame | None = None) -> SolveResult:
+                 config: OptimizerConfig, od_b: pd.DataFrame | None = None,
+                 apt_b: pd.DataFrame | None = None, floors: dict | None = None) -> SolveResult:
     """Solve one or more months in a single model."""
     months = sorted(base_b["month"].unique())
     prob = pulp.LpProblem("network_" + "_".join(map(str, months)), pulp.LpMaximize)
@@ -109,10 +110,11 @@ def _solve_block(opts: pd.DataFrame, base_b: pd.DataFrame, cap_b: pd.DataFrame,
             bh = pulp.lpSum(g.at[i, "block_hours"] * x[i] for i in g.index)
             tag = f"{c['fleet_type']}_{c['month']}"
             prob += bh <= c["block_hours_available"], f"fleet_{tag}"
-            if config.min_fleet_utilisation > 0:
+            util = (floors or {}).get(c["month"], config.min_fleet_utilisation)
+            if util > 0:
                 # Never demand more than the options can physically absorb.
                 max_bh = g.groupby("sector")["block_hours"].max().sum()
-                floor = min(config.min_fleet_utilisation * c["block_hours_available"], 0.999 * max_bh)
+                floor = min(util * c["block_hours_available"], 0.999 * max_bh)
                 prob += bh >= floor, f"fleet_min_{tag}"
 
     for m in months:
@@ -128,8 +130,20 @@ def _solve_block(opts: pd.DataFrame, base_b: pd.DataFrame, cap_b: pd.DataFrame,
                     prob += (pulp.lpSum(a.at[i, "weekly_freq"] * x[i] for i in a.index)
                              == pulp.lpSum(b.at[i, "weekly_freq"] * x[i] for i in b.index)), f"pair_{s}_{m}"
 
+        # Airport restrictions (partial NOTAM / slots): cap our departures or movements.
+        if apt_b is not None and len(apt_b):
+            for c in apt_b[apt_b["month"] == m].itertuples():
+                dep = om["sector"].str.split("-").str[0] == c.airport
+                arr = om["sector"].str.split("-").str[-1] == c.airport
+                if pd.notna(c.max_departures):
+                    prob += (pulp.lpSum(om.at[i, "departures"] * x[i] for i in om.index[dep])
+                             <= c.max_departures), f"apt_dep_{c.airport}_{m}"
+                if pd.notna(c.max_movements):
+                    prob += (pulp.lpSum(om.at[i, "departures"] * x[i] for i in om.index[dep | arr])
+                             <= c.max_movements), f"apt_mov_{c.airport}_{m}"
+
         if config.market_min_ask_share is not None:
-            bm = base_b[base_b["month"] == m]
+            bm = base_b[(base_b["month"] == m) & ~base_b["closed"].astype(bool)]  # closed sectors can't count
             ly_ask = bm.groupby("market")["ly_ask"].sum()
             for mkt, g in om.groupby("market"):
                 if ly_ask.get(mkt, 0) > 0:
@@ -154,7 +168,9 @@ def _route_key(sector: str) -> str:
 
 
 def _solve_months(opts, base, cap, config, months, forbid: frozenset,
-                  od: pd.DataFrame | None = None) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
+                  od: pd.DataFrame | None = None,
+                  apt: pd.DataFrame | None = None,
+                  floors: dict | None = None) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
     """Solve each month independently; routes in `forbid` may only take frequency 0."""
     chosen, obj, flows = [], {}, []
     if forbid:
@@ -163,7 +179,7 @@ def _solve_months(opts, base, cap, config, months, forbid: frozenset,
     for m in months:
         od_m = od[od["month"] == m] if od is not None else None
         res = solve_block(opts[opts["month"] == m], base[base["month"] == m], cap[cap["month"] == m],
-                          config, od_m)
+                          config, od_m, apt, floors)
         chosen.append(res.chosen)
         flows.append(res.flows)
         obj[m] = res.objective
@@ -198,12 +214,16 @@ def optimise_full(base: pd.DataFrame, config: OptimizerConfig, fleet: pd.DataFra
     if missing:
         raise ValueError(f"No fleet capacity for fleet types {sorted(missing)} (add them to the fleet file)")
     months = sorted(base["month"].unique())
+    # Set by the pipeline from the disruptions file: airport caps and the fleet
+    # utilisation floor for disrupted months.
+    apt = base.attrs.get("airport_caps")
+    floors = base.attrs.get("fleet_floor_by_month")
 
     launch = (base[base["launch_cost"] > 0].assign(route=lambda d: d["sector"].map(_route_key))
               .drop_duplicates("sector").groupby("route")["launch_cost"].sum())
     forbid: frozenset = frozenset()
     while True:
-        chosen, obj, flows = _solve_months(opts, base, cap, config, months, forbid, od)
+        chosen, obj, flows = _solve_months(opts, base, cap, config, months, forbid, od, apt, floors)
         flown = chosen[(chosen["weekly_freq"] > 0)].assign(route=lambda d: d["sector"].map(_route_key))
         shortfall = {}
         for route, cost in launch.items():
@@ -212,7 +232,7 @@ def optimise_full(base: pd.DataFrame, config: OptimizerConfig, fleet: pd.DataFra
             fm = sorted(flown.loc[flown["route"] == route, "month"].unique())
             if not fm:
                 continue
-            _, obj_wo, _ = _solve_months(opts, base, cap, config, fm, forbid | {route}, od)
+            _, obj_wo, _ = _solve_months(opts, base, cap, config, fm, forbid | {route}, od, apt, floors)
             value = sum(obj[m] - obj_wo[m] for m in fm)
             if value < cost:
                 shortfall[route] = cost - value

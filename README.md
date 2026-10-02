@@ -50,6 +50,7 @@ cost files (CSV/Excel; templates can be downloaded from the sidebar), then:
 | Sector plan | Filterable sector-month plan with actions, LF, fare, break-even LF and ±1/wk marginal value |
 | New routes | Launch / not-launch decision per candidate route, first-year economics, monthly plan |
 | ATF scenarios | Network net profit per fuel scenario and which decisions change with ATF |
+| Disruptions | Re-plan vs normal plan per month: profit impact, block hours released, CANCEL / CUT / ADD per sector |
 | Download | Full Excel workbook, plan CSV, assumptions used |
 
 ### Python / notebook
@@ -74,6 +75,7 @@ write_excel(res, "network_plan.xlsx")
 | **fleet** | `fleet_type`, `aircraft`, `block_hours_per_day` | `seats` |
 | **constraints** | `sector` | `month`, `min_weekly`, `max_weekly`, `fixed_weekly`, `must_operate` |
 | **od** (connecting traffic LY, one row per itinerary per month) | `month`, `legs` (`DXB-BOM;BOM-BLR` in travel order, or `leg1`, `leg2`, …), `pax`, `revenue` (total itinerary revenue) or `avg_fare` | `od` (label); for new connections over new routes: estimated `pax`, or `est_daily_pax` + `avg_fare` with `month` blank |
+| **disruptions** (NOTAMs, airport limits, demand shocks) | `month` (blank = all), ONE of `airport` / `sector` / `market`, and any of `closed` (1), `demand_change` (-0.3 or -30), `fare_change`, `max_daily_departures`, `max_daily_movements` (airport only) | `note` |
 | **new_routes** (routes not flown LY) | `sector` (or `origin`+`destination`), `distance_km`, and either `est_daily_pax` + `est_avg_fare` **or** `proxy_sector` | `market`, `fleet_type`, `seats_per_flight`, `block_hours`, `ref_weekly` (7), `demand_scale`, `fare_scale`, `start_month`, `ramp_months`, `ramp_start`, `launch_cost`, `max_weekly`, `both_directions` (1) |
 
 Without a fleet file, each month may use at most last year's block hours
@@ -106,6 +108,42 @@ Without a fleet file, each month may use at most last year's block hours
    0.85× / 1.0× / 1.15× / 1.30× the estimate. Each sector is tagged
    STABLE / ATF-SENSITIVE / AT RISK, so you know which decisions hold whatever
    fuel does.
+
+### Disruptions: NOTAMs and sudden demand drops
+When an airport is closed or restricted by a NOTAM, or demand suddenly falls,
+re-plan just the affected month:
+
+```bash
+python -m network_rm_optimizer optimise ... --disruptions disruptions.csv --months 11
+```
+
+| Disruption | Row example | Effect |
+|---|---|---|
+| Airport closed | `11,GOI,closed=1` | Every sector to/from GOI gets frequency 0 that month, **overriding must-operate and minimums**. Connections over GOI are lost. |
+| Partial NOTAM / slots | `11,BLR,max_daily_departures=8` (or `max_daily_movements`) | Our departures (or departures + arrivals) at the airport are capped. The optimiser keeps the most valuable flights. |
+| Demand / fare shock | `11,DXB,demand_change=-0.3` | Local demand on matching sectors and connecting O&Ds starting/ending there fall 30% (`fare_change` likewise). Scope can be an airport, a sector or a market. |
+
+What the run does:
+* **Re-optimises the whole network for that month**: cancels what can't fly,
+  cuts what no longer pays, and moves aircraft to where they still earn.
+* **Lets aircraft be parked**: in disrupted months the fleet utilisation floor
+  is `disruption_min_fleet_utilisation` (default 0), so freed aircraft aren't
+  forced onto loss-making flying. Released block hours are reported, to wet-lease
+  out, bring maintenance forward or hold as a spare. Normal months keep the
+  usual floor.
+* **Compares with the normal plan**: the `disruption_impact` sheet lists each
+  affected or rescheduled sector-month (CANCEL / CUT / ADD) with normal vs
+  re-planned frequency, pax, revenue and net profit. `disruption_summary`
+  gives the monthly cost of the disruption and the block hours released.
+  The Disruptions tab in the dashboard shows the same.
+* `--months 11` (or "Months to plan" in the dashboard) plans just that month,
+  in about 2-3 seconds. Calibration and seasonality still use the full year.
+
+On the sample (November: GOI closed, DXB demand −30%, BLR capped at 8
+departures/day), the re-plan cancels GOI, halves DXB frequencies and stays
+within the BLR cap. Net profit falls by about ₹14 Cr against the normal plan.
+Forcing the usual 90% fleet utilisation instead would have lost a further
+~₹14 Cr by flying the freed aircraft to DXB at about 50% load factor.
 
 ### Connecting traffic (O&D)
 Without an O&D file every sector is judged on its own revenue. A sector that
@@ -229,6 +267,7 @@ Then:
 | `fleet_utilisation` | Block hours available vs LY vs recommended |
 | `od_flows` | Per connecting O&D (full year and by month): LY, demand, at-LY-schedule and recommended pax and revenue, weakest leg |
 | `new_routes` | Launch decision and first-year economics per new sector (when a new-routes file is given) |
+| `disruption_impact`, `disruption_summary` | Normal plan vs re-plan per sector-month and per month (when a disruptions file is given) |
 | `new_route_scenarios`, `new_route_scenario_summary` | Launch decision, frequency and yr-1 result per new route at each demand scale, with a verdict |
 | `atf_frequencies`, `atf_summary` | Frequencies and network P&L under each ATF scenario, plus the robustness tag |
 | `assumptions` | Every parameter used |
@@ -249,7 +288,8 @@ Then:
 `fare_capacity_elasticity`, `demand_cv`, `variable_cost_share`, `fuel_share`,
 `min_weekly_if_operated`, `max_weekly_multiplier`, `pair_directions`,
 `new_route_ramp_months`, `new_route_ramp_start`, `new_route_demand_scenarios`,
-`min_fleet_utilisation`, `market_min_ask_share`, `atf_scenarios`.
+`min_fleet_utilisation`, `disruption_min_fleet_utilisation`, `plan_months`, `market_min_ask_share`,
+`atf_scenarios`.
 
 ## Limitations / next steps
 * New-route demand is only as good as your estimate or proxy. The demand-scale

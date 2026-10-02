@@ -7,6 +7,7 @@ import pandas as pd
 from .config import OptimizerConfig
 from .data import load_constraints, load_fleet, prepare_costs, prepare_history, prepare_new_routes
 from .demand import calibrate, evaluate, frequency_options
+from .disruptions import airport_caps, apply_disruptions, load_disruptions
 from .od import allocate_flows, capture_share, finalize_od, od_demand, parse_od, split_local
 from .optimizer import fleet_capacity, optimise_full
 
@@ -94,6 +95,9 @@ def baseline_flows(od: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
     scale = lr.groupby("od_id")["ratio"].min().clip(upper=1.0)
     pax = od["demand"] * od["od_id"].map(scale).fillna(1.0)
     pax = pax.where(~od["is_new_od"].astype(bool), 0.0)  # new routes are not in last year's schedule
+    closed = base.set_index(["sector", "month"])["closed"].astype(bool)
+    dead = [any(closed.get((leg, m), False) for leg in L) for L, m in zip(od["leg_list"], od["month"])]
+    pax = pax.where(~np.asarray(dead), 0.0)  # a closed leg kills the connection
     return pd.DataFrame({"od_id": od["od_id"], "month": od["month"], "pax": pax, "fare": od["plan_fare"]})
 
 
@@ -122,7 +126,9 @@ def build_plan(base: pd.DataFrame, chosen: pd.DataFrame, config: OptimizerConfig
     plan = base.copy()
     rec = chosen[METRICS + ["weekly_freq", "avg_fare", "cost_per_departure"]].add_prefix("rec_")
     plan = plan.join(rec)
-    baseline = evaluate(base, base["ly_weekly_freq"], config)[METRICS].add_prefix("base_")
+    # LY schedule at new cost - except where a disruption closes the sector.
+    base_w = np.where(base["closed"].astype(bool), 0.0, base["ly_weekly_freq"])
+    baseline = evaluate(base, base_w, config)[METRICS].add_prefix("base_")
     plan = plan.join(baseline)
     has_od = od is not None and len(od) > 0
     plan = _add_connecting(plan, "rec_", allocate_flows(flows, od) if has_od else None)
@@ -184,7 +190,7 @@ PLAN_COLUMNS = [
     "breakeven_lf_full_cost", "breakeven_lf_variable",
     "rec_launch_cost", "ly_spill_pax", "rec_pax", "rec_ask", "rec_block_hours",
     "ly_conn_pax", "rec_local_pax", "rec_conn_pax", "rec_local_revenue", "rec_conn_revenue",
-    "rec_beyond_revenue", "rec_network_contribution",
+    "rec_beyond_revenue", "rec_network_contribution", "disruption",
 ]
 
 
@@ -295,6 +301,40 @@ def od_summary(od: pd.DataFrame, flows: pd.DataFrame, base_fl: pd.DataFrame, pla
          "displaced_revenue", "weakest_leg", "weakest_leg_freq_ratio"]]
 
 
+def disruption_impact(plan_normal: pd.DataFrame, plan_dis: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Normal plan vs plan with disruptions: what changes and what it costs."""
+    k = ["month", "market", "sector"]
+    n = plan_normal.set_index(k)
+    d = plan_dis.set_index(k)
+    t = pd.DataFrame({
+        "disruption": d["disruption"],
+        "normal_weekly": n["rec_weekly_freq"], "disrupted_weekly": d["rec_weekly_freq"],
+        "normal_pax": n["rec_pax"], "disrupted_pax": d["rec_pax"],
+        "normal_revenue": n["rec_revenue"], "disrupted_revenue": d["rec_revenue"],
+        "normal_net_profit": n["rec_net_profit"], "disrupted_net_profit": d["rec_net_profit"],
+        "normal_block_hours": n["rec_block_hours"], "disrupted_block_hours": d["rec_block_hours"],
+    }).reset_index()
+    t["weekly_change"] = t["disrupted_weekly"] - t["normal_weekly"]
+    t["net_profit_change"] = t["disrupted_net_profit"] - t["normal_net_profit"]
+    t["action"] = np.select(
+        [t["disruption"].str.contains("CLOSED") & (t["disrupted_weekly"] == 0),
+         t["weekly_change"] < -0.5, t["weekly_change"] > 0.5],
+        ["CANCEL (closed)", "CUT", "ADD (redeployed)"], "NO CHANGE")
+    detail = t[(t["disruption"] != "") | (t["weekly_change"].abs() > 0.5)].sort_values(
+        ["month", "net_profit_change"])
+    summary = t.groupby("month", as_index=False).agg(
+        sectors_disrupted=("disruption", lambda v: int((v != "").sum())),
+        sectors_rescheduled=("weekly_change", lambda v: int((v.abs() > 0.5).sum())),
+        normal_revenue=("normal_revenue", "sum"), disrupted_revenue=("disrupted_revenue", "sum"),
+        normal_net_profit=("normal_net_profit", "sum"), disrupted_net_profit=("disrupted_net_profit", "sum"),
+        normal_block_hours=("normal_block_hours", "sum"), disrupted_block_hours=("disrupted_block_hours", "sum"))
+    summary["net_profit_change"] = summary["disrupted_net_profit"] - summary["normal_net_profit"]
+    # Block hours not flown = aircraft time to park, wet-lease out or use for maintenance.
+    summary["block_hours_released"] = summary["normal_block_hours"] - summary["disrupted_block_hours"]
+    summary = summary[summary["sectors_disrupted"] > 0]
+    return detail, summary
+
+
 def run_new_route_demand_scenarios(base, config, fleet, cons, chosen_base, od=None,
                                    flows_base=None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Re-optimise with every new route's demand scaled; report decisions per route.
@@ -397,7 +437,7 @@ def run_scenarios(base, config, fleet, cons, od=None) -> tuple[pd.DataFrame, pd.
 
 def run(history, cost_forecast, fleet=None, constraints=None,
         config: OptimizerConfig | None = None, scenarios: bool = True,
-        new_routes=None, od=None) -> dict[str, pd.DataFrame]:
+        new_routes=None, od=None, disruptions=None) -> dict[str, pd.DataFrame]:
     config = config or OptimizerConfig()
     config.validate()
     fleet_df = load_fleet(fleet)
@@ -412,9 +452,23 @@ def run(history, cost_forecast, fleet=None, constraints=None,
         base = calibrate(pd.concat([base, nr], ignore_index=True), config)
     # All O&Ds, including new connections over new routes.
     od_raw = finalize_od(od_parsed, base, config) if od_parsed is not None else None
+    if config.plan_months:
+        # Seasonality and calibration above used the full year; plan only these months.
+        base = base[base["month"].isin(config.plan_months)].reset_index(drop=True)
+        if od_raw is not None:
+            od_raw = od_raw[od_raw["month"].isin(config.plan_months)].reset_index(drop=True)
     base = prepare_costs(cost_forecast, base, config)
     cons = load_constraints(constraints)
-    od_d = od_demand(od_raw, base, config) if od_raw is not None else None
+
+    # Disruptions (NOTAMs, airport caps, demand shocks) on top of the normal plan.
+    dis = load_disruptions(disruptions)
+    base_normal = base
+    base = calibrate(apply_disruptions(base, dis), config)
+    base.attrs["airport_caps"] = airport_caps(dis, base)
+    if dis is not None and len(dis):
+        base.attrs["fleet_floor_by_month"] = {int(m): config.disruption_min_fleet_utilisation
+                                              for m in dis["month"].unique()}
+    od_d = od_demand(od_raw, base, config, dis=dis) if od_raw is not None else None
 
     chosen, flows = optimise_full(base, config, fleet_df, cons, od=od_d)
     plan = build_plan(base, chosen, config, cons, od_d, flows)
@@ -435,6 +489,11 @@ def run(history, cost_forecast, fleet=None, constraints=None,
                      + [c for c in plan.columns if c.startswith("marginal_")]],
         "fleet_utilisation": fleet_use,
     }
+    if dis is not None and len(dis):
+        od_n = od_demand(od_raw, base_normal, config) if od_raw is not None else None
+        ch_n, fl_n = optimise_full(base_normal, config, fleet_df, cons, od=od_n)
+        plan_n = build_plan(base_normal, ch_n, config, cons, od_n, fl_n)
+        out["disruption_impact"], out["disruption_summary"] = disruption_impact(plan_n, plan)
     if od_d is not None:
         out["od_flows"] = od_summary(od_d, flows, baseline_flows(od_d, base), plan, config)
     if base["is_new"].any():

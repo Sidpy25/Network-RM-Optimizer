@@ -1,0 +1,4 @@
+month,airport,sector,market,closed,demand_change,fare_change,max_daily_departures,max_daily_movements,note
+11,GOI,,,1.0,,,,,Runway NOTAM - airport closed all month
+11,DXB,,,,-0.3,,,,Sudden demand drop
+11,BLR,,,,,,8.0,,Partial NOTAM - night closure

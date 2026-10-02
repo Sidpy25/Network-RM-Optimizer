@@ -44,11 +44,11 @@ def read_upload(f) -> pd.DataFrame | None:
 
 
 @st.cache_data(show_spinner=False)
-def optimise(history, costs, fleet, constraints, new_routes, od, cfg_dict, scenarios):
+def optimise(history, costs, fleet, constraints, new_routes, od, disruptions, cfg_dict, scenarios):
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         res = run(history, costs, fleet, constraints, OptimizerConfig(**cfg_dict), scenarios=scenarios,
-                  new_routes=new_routes, od=od)
+                  new_routes=new_routes, od=od, disruptions=disruptions)
     msgs = sorted({str(x.message) for x in w if not issubclass(x.category, DeprecationWarning)})
     return res, msgs
 
@@ -69,6 +69,9 @@ if source == "Sample network":
                                           frames["fleet"], frames["constraints"])
     new_routes = frames["new_routes"] if st.sidebar.checkbox("Include 3 candidate new routes", True) else None
     od = frames["od"] if st.sidebar.checkbox("Include connecting traffic (O&D)", True) else None
+    disruptions = frames["disruptions"] if st.sidebar.checkbox(
+        "Apply sample Nov disruptions", False,
+        help="GOI closed (NOTAM), DXB demand −30%, BLR capped at 8 departures/day - all in November.") else None
     st.sidebar.caption("Synthetic Indian domestic + Gulf network, 18 sectors, INR.")
 else:
     history = read_upload(st.sidebar.file_uploader("LY sector-month history *", ["csv", "xlsx"]))
@@ -79,6 +82,10 @@ else:
         "New routes not flown LY (optional)", ["csv", "xlsx"],
         help="One row per candidate route: distance_km plus est_daily_pax + est_avg_fare, "
              "or a proxy_sector to borrow demand/fare/seasonality from. See the template."))
+    disruptions = read_upload(st.sidebar.file_uploader(
+        "Disruptions: NOTAMs / demand shocks (optional)", ["csv", "xlsx"],
+        help="month + one of airport/sector/market, and closed (1), demand_change (-0.3), fare_change, "
+             "max_daily_departures or max_daily_movements. See the template."))
     od = read_upload(st.sidebar.file_uploader(
         "Connecting O&D traffic LY (optional)", ["csv", "xlsx"],
         help="One row per connecting itinerary per month: month, legs ('DXB-BOM;BOM-BLR'), pax, revenue. "
@@ -97,6 +104,9 @@ objective = st.sidebar.selectbox(
     format_func=lambda x: {"contribution": "Contribution (= network net profit, fixed costs sunk)",
                            "profit": "Fully allocated profit (all costs avoidable)"}[x])
 target_year = st.sidebar.number_input("Planning year", 2020, 2040, d.target_year)
+plan_months = st.sidebar.multiselect(
+    "Months to plan (blank = all year)", list(range(1, 13)), format_func=lambda m: MONTHS[m - 1],
+    help="Re-plan just next month after a NOTAM or demand shock - much faster.")
 c1, c2 = st.sidebar.columns(2)
 demand_growth = c1.number_input("Demand growth %", -50.0, 100.0, 0.0, 1.0) / 100
 fare_growth = c2.number_input("Fare change %", -50.0, 100.0, 0.0, 1.0) / 100
@@ -124,6 +134,10 @@ with st.sidebar.expander("Cost"):
 with st.sidebar.expander("Network constraints"):
     min_util = st.slider("Min fleet utilisation", 0.0, 1.0, d.min_fleet_utilisation, 0.05,
                          help="Share of available block hours that must be flown. 0 lets the model ground aircraft.")
+    dis_util = st.slider("Min fleet utilisation in disrupted months", 0.0, 1.0,
+                         d.disruption_min_fleet_utilisation, 0.05,
+                         help="0 = aircraft freed by a closure or demand drop may be parked / wet-leased out "
+                              "rather than flown at a loss.")
     headroom = st.slider("Block-hour headroom vs LY (no fleet file)", -0.3, 0.5, d.fleet_headroom, 0.05)
     min_wk = st.number_input("Min weekly frequency if operated", 1, 14, d.min_weekly_if_operated)
     max_mult = st.slider("Max frequency × LY", 1.0, 3.0, d.max_weekly_multiplier, 0.1)
@@ -187,6 +201,7 @@ cfg = dict(
     new_route_demand_scenarios=nr_scen,
     fleet_headroom=headroom, market_min_ask_share=mkt_share if use_mkt else None,
     min_fleet_utilisation=min_util, atf_scenarios=atf,
+    disruption_min_fleet_utilisation=dis_util, plan_months=tuple(sorted(plan_months)),
 )
 run_scen = bool(atf) or bool(nr_scen)
 
@@ -194,7 +209,7 @@ if st.sidebar.button("▶ Run optimiser", type="primary", width="stretch") or "r
     with st.spinner("Calibrating demand and solving the network…"):
         try:
             st.session_state.res, st.session_state.msgs = optimise(
-                history, costs, fleet, constraints, new_routes, od, cfg, run_scen)
+                history, costs, fleet, constraints, new_routes, od, disruptions, cfg, run_scen)
             st.session_state.cfg = cfg
         except Exception as e:  # show input / infeasibility problems to the user
             st.session_state.pop("res", None)
@@ -226,7 +241,7 @@ st.caption("Deltas compare the recommendation with flying **last year's schedule
            f"LY actual net profit was {cr(tot.ly_net_profit)}.")
 
 tabs = st.tabs(["Network", "Markets", "Schedule", "Sector plan", "Connections", "New routes", "ATF scenarios",
-                "Download"])
+                "Disruptions", "Download"])
 
 # ----------------------------------------------------------------- Network tab
 with tabs[0]:
@@ -592,8 +607,46 @@ with tabs[6]:
         view = view.assign(month=view["month"].map(lambda m: MONTHS[m - 1]))
         st.dataframe(view, hide_index=True, width="stretch")
 
-# -------------------------------------------------------------- Download tab
+# ------------------------------------------------------------- Disruptions tab
 with tabs[7]:
+    ds, di = res.get("disruption_summary"), res.get("disruption_impact")
+    if ds is None:
+        st.info("No disruptions in this run. Upload a disruptions file (NOTAM closures, airport movement caps, "
+                "demand or fare shocks) or tick the sample in the sidebar. Tip: choose just the affected "
+                "month under 'Months to plan' for a fast re-plan.")
+    else:
+        st.subheader("Re-plan for disruptions vs the normal plan")
+        for r in ds.itertuples():
+            c = st.columns(4)
+            c[0].metric(f"{MONTHS[int(r.month) - 1]}: net profit", cr(r.disrupted_net_profit),
+                        cr(r.net_profit_change))
+            c[1].metric("Normal plan net profit", cr(r.normal_net_profit))
+            c[2].metric("Sectors rescheduled", int(r.sectors_rescheduled))
+            c[3].metric("Block hours released", f"{r.block_hours_released:,.0f}",
+                        help="Aircraft time not flown vs the normal plan: park, wet-lease out or do maintenance.")
+        st.caption("The disrupted plan cancels closed sectors, respects airport caps and re-optimises the rest, "
+                   "including connections. In disrupted months the fleet utilisation floor is "
+                   f"{st.session_state.cfg['disruption_min_fleet_utilisation']:.0%}, so freed aircraft are only "
+                   "redeployed where they make money.")
+        icon = {"CANCEL (closed)": "⛔ CANCEL (closed)", "CUT": "🔻 CUT", "ADD (redeployed)": "🔺 ADD (redeployed)",
+                "NO CHANGE": "NO CHANGE"}
+        v = di.assign(month=di["month"].map(lambda m: MONTHS[int(m) - 1]), action=di["action"].map(icon))
+        for c_ in ["normal_net_profit", "disrupted_net_profit", "net_profit_change"]:
+            v[c_] = v[c_] / 1e7
+        st.dataframe(v[["month", "sector", "action", "disruption", "normal_weekly", "disrupted_weekly",
+                        "normal_pax", "disrupted_pax", "normal_net_profit", "disrupted_net_profit",
+                        "net_profit_change"]], hide_index=True, width="stretch", column_config={
+            "month": "Month", "sector": "Sector", "action": "Action", "disruption": "Disruption",
+            "normal_weekly": st.column_config.NumberColumn("Normal /wk", format="%.0f"),
+            "disrupted_weekly": st.column_config.NumberColumn("Re-planned /wk", format="%.0f"),
+            "normal_pax": st.column_config.NumberColumn("Normal pax", format="%.0f"),
+            "disrupted_pax": st.column_config.NumberColumn("Re-planned pax", format="%.0f"),
+            "normal_net_profit": st.column_config.NumberColumn("Normal ₹Cr", format="%.2f"),
+            "disrupted_net_profit": st.column_config.NumberColumn("Re-planned ₹Cr", format="%.2f"),
+            "net_profit_change": st.column_config.NumberColumn("Change ₹Cr", format="%+.2f")})
+
+# -------------------------------------------------------------- Download tab
+with tabs[8]:
     st.subheader("Export")
     st.download_button("⬇ Full results workbook (.xlsx)", to_excel_bytes(res), "network_plan.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")

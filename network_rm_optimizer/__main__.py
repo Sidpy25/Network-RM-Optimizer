@@ -40,6 +40,10 @@ def main(argv=None) -> int:
     o.add_argument("--constraints", help="sector min/max/must-operate/fixed frequencies")
     o.add_argument("--new-routes", help="candidate sectors not flown last year (csv/xlsx)")
     o.add_argument("--od", help="last year's connecting O&D traffic (csv/xlsx)")
+    o.add_argument("--disruptions", help="NOTAMs / airport caps / demand shocks (csv/xlsx)")
+    o.add_argument("--months", type=str, help="plan only these months, e.g. 11 or 11,12")
+    o.add_argument("--disruption-floor", type=float, dest="disruption_min_fleet_utilisation",
+                   help="fleet utilisation floor in disrupted months (default 0 = may park aircraft)")
     o.add_argument("--config", help="JSON file with OptimizerConfig overrides")
     o.add_argument("--objective", choices=["contribution", "profit"])
     o.add_argument("--target-year", type=int)
@@ -73,7 +77,8 @@ def main(argv=None) -> int:
             overrides.update(json.load(fh))
     for k in ("objective", "target_year", "demand_growth", "fare_growth", "frequency_elasticity",
               "fare_capacity_elasticity", "variable_cost_share", "fuel_share",
-              "market_min_ask_share", "fleet_headroom", "min_fleet_utilisation"):
+              "market_min_ask_share", "fleet_headroom", "min_fleet_utilisation",
+              "disruption_min_fleet_utilisation"):
         v = getattr(a, k)
         if v is not None:
             overrides[k] = v
@@ -81,15 +86,17 @@ def main(argv=None) -> int:
         overrides["pair_directions"] = False
     if a.atf:
         overrides["atf_scenarios"] = tuple(float(x) for x in a.atf.split(","))
+    if a.months:
+        overrides["plan_months"] = tuple(int(x) for x in a.months.split(",") if x.strip())
     if a.nr_demand is not None:
         overrides["new_route_demand_scenarios"] = tuple(float(x) for x in a.nr_demand.split(",") if x.strip())
-    for k in ("atf_scenarios", "new_route_demand_scenarios"):
+    for k in ("atf_scenarios", "new_route_demand_scenarios", "plan_months"):
         if k in overrides:
             overrides[k] = tuple(overrides[k])
     cfg = OptimizerConfig(**overrides)
 
     res = run(a.history, a.costs, a.fleet, a.constraints, cfg, scenarios=not a.no_scenarios,
-              new_routes=a.new_routes, od=a.od)
+              new_routes=a.new_routes, od=a.od, disruptions=a.disruptions)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     write_excel(res, a.out)
 
@@ -130,6 +137,16 @@ def main(argv=None) -> int:
         ns = res["new_route_scenario_summary"]
         print("\nNew-route demand scenarios (decision at each demand scale):")
         print(ns[["market", "route"] + [c for c in ns.columns if c.startswith("x")] + ["verdict"]]
+              .to_string(index=False))
+    if "disruption_summary" in res:
+        ds = res["disruption_summary"]
+        print("\nDisruption impact (vs the normal plan):")
+        print(ds.assign(normal_cr=ds.normal_net_profit / 1e7, disrupted_cr=ds.disrupted_net_profit / 1e7,
+                        change_cr=ds.net_profit_change / 1e7)[
+            ["month", "sectors_disrupted", "sectors_rescheduled", "normal_cr", "disrupted_cr", "change_cr",
+             "block_hours_released"]].round(2).to_string(index=False))
+        di = res["disruption_impact"]
+        print(di[["month", "sector", "disruption", "normal_weekly", "disrupted_weekly", "action"]]
               .to_string(index=False))
     if "od_flows" in res:
         o_ = res["od_flows"]
