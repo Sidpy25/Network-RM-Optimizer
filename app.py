@@ -120,6 +120,9 @@ with st.sidebar.expander("Network constraints"):
                              help="Months for a new route to reach mature demand (per-route override in the file).")
     ramp_s = st.slider("New route launch-month demand", 0.1, 1.0, d.new_route_ramp_start, 0.05,
                        help="Share of mature demand in the launch month.")
+    nr_txt = st.text_input("New route demand scenarios (× estimate)",
+                           ", ".join(f"{x:g}" for x in d.new_route_demand_scenarios),
+                           help="Re-optimise with every new route's demand scaled by each factor. Blank = off.")
     use_mkt = st.checkbox("Protect market presence")
     mkt_share = st.slider("Min share of LY ASK per market", 0.0, 1.0, 0.7, 0.05, disabled=not use_mkt)
 
@@ -153,8 +156,9 @@ def _overrides(col, scale=1.0):
 
 try:
     atf = tuple(float(x) for x in atf_txt.replace(" ", "").split(",") if x)
+    nr_scen = tuple(float(x) for x in nr_txt.replace(" ", "").split(",") if x)
 except ValueError:
-    st.error("ATF scenarios must be a comma-separated list of numbers, e.g. 0.9, 1, 1.2")
+    st.error("Scenario lists must be comma-separated numbers, e.g. 0.9, 1, 1.2")
     st.stop()
 
 cfg = dict(
@@ -167,10 +171,11 @@ cfg = dict(
     variable_cost_share=var_share, fuel_share=fuel_share,
     min_weekly_if_operated=int(min_wk), max_weekly_multiplier=max_mult, pair_directions=pair,
     new_route_ramp_months=int(ramp_m), new_route_ramp_start=ramp_s,
+    new_route_demand_scenarios=nr_scen,
     fleet_headroom=headroom, market_min_ask_share=mkt_share if use_mkt else None,
     min_fleet_utilisation=min_util, atf_scenarios=atf,
 )
-run_scen = bool(atf)
+run_scen = bool(atf) or bool(nr_scen)
 
 if st.sidebar.button("▶ Run optimiser", type="primary", width="stretch") or "res" not in st.session_state:
     with st.spinner("Calibrating demand and solving the network…"):
@@ -420,6 +425,36 @@ with tabs[4]:
                          "first_year_net_after_launch": st.column_config.NumberColumn(
                              "Yr-1 contribution after launch ₹Cr", format="%.2f"),
                          "load_factor": st.column_config.NumberColumn("LF", format="percent")})
+        ns, nl = res.get("new_route_scenario_summary"), res.get("new_route_scenarios")
+        if ns is not None and not ns.empty:
+            st.subheader("How much does the launch decision depend on the demand estimate?")
+            st.caption("The whole network is re-optimised with every new route's demand scaled. "
+                       "Routes are shown per city pair (both directions, launch cost counted once).")
+            routes = ns["route"].tolist()
+            if len(routes) <= 8:  # one hue per route from the fixed categorical order
+                cat = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+                cl = nl.assign(**{"₹ Cr": nl["first_year_net_after_launch"] / 1e7,
+                                  "Demand": nl["demand_scale"].map(lambda x: f"×{x:g}")})
+                order = [f"×{x:g}" for x in sorted(nl["demand_scale"].unique())]
+                lines = alt.Chart(cl).mark_line(strokeWidth=2, point=alt.OverlayMarkDef(size=64, filled=True)).encode(
+                    x=alt.X("Demand:N", sort=order, title="New-route demand vs estimate",
+                            axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("₹ Cr:Q", title="Yr-1 contribution after launch cost (₹ Cr)"),
+                    color=alt.Color("route:N", title=None, legend=alt.Legend(orient="top"),
+                                    scale=alt.Scale(domain=routes, range=cat[:len(routes)])),
+                    tooltip=["route", "Demand", "decision", alt.Tooltip("₹ Cr:Q", format=",.2f"),
+                             alt.Tooltip("avg_weekly_when_flown:Q", title="Avg /wk", format=".1f"),
+                             alt.Tooltip("load_factor:Q", title="LF", format=".0%")])
+                zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#8a8985", strokeDash=[3, 3]).encode(y="y:Q")
+                st.altair_chart((zero + lines).properties(height=300), width="stretch")
+            icon = {"LAUNCH": "✅ LAUNCH", "NOT LAUNCHED": "⛔ no"}
+            sv = ns[["market", "route", "verdict"] + [c for c in ns.columns if c.startswith("x")]].copy()
+            for c in sv.columns:
+                if c.startswith("x"):
+                    sv[c] = sv[c].map(icon)
+            sv = sv.rename(columns={c: f"Demand ×{c[1:]}" for c in sv.columns if c.startswith("x")})
+            st.dataframe(sv, hide_index=True, width="stretch",
+                         column_config={"market": "Market", "route": "Route", "verdict": "Verdict"})
         nplan = plan[plan["is_new"] & (plan["rec_weekly_freq"] > 0)].copy()
         nplan["Month"] = nplan["month"].map(lambda m: MONTHS[m - 1])
         st.subheader("Monthly plan for launched routes")

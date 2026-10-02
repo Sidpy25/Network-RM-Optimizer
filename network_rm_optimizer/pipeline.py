@@ -179,6 +179,80 @@ def new_route_summary(plan: pd.DataFrame, config: OptimizerConfig) -> pd.DataFra
         "first_year_net_after_launch", ascending=False)
 
 
+def _route_key(sector: str) -> str:
+    return "-".join(sorted(sector.split("-")))
+
+
+def _network_net_profit(ch: pd.DataFrame, base: pd.DataFrame, cost_multiplier: float = 1.0) -> float:
+    """Contribution - fixed cost pool - launch costs of routes flown, for a chosen plan."""
+    cpd = base["new_cost_per_departure"] * (1 + base["fuel_share"] * (cost_multiplier - 1))
+    fixed = ((1 - base["variable_cost_share"]) * cpd * base["ly_departures"]).sum()
+    launched = ch.loc[ch["weekly_freq"] > 0, ["sector", "launch_cost"]].drop_duplicates("sector")
+    return float(ch["contribution"].sum() - fixed - launched["launch_cost"].sum())
+
+
+def run_new_route_demand_scenarios(base, config, fleet, cons, chosen_base) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Re-optimise with every new route's demand scaled; report decisions per route.
+
+    Routes are reported per city pair (both directions together, launch cost
+    counted once).
+    """
+    new = base["is_new"]
+    rows = []
+    for scale in sorted(config.new_route_demand_scenarios):
+        if np.isclose(scale, 1.0):
+            ch = chosen_base
+        else:
+            b = base.copy()
+            b.loc[new, "ref_demand"] = b.loc[new, "ref_demand"] * scale
+            ch = optimise(b, config, fleet, cons)
+        net = _network_net_profit(ch, base)
+        n = ch[ch["is_new"]].assign(route=lambda d: d["sector"].map(_route_key))
+        launch = (base[new].drop_duplicates("sector").assign(route=lambda d: d["sector"].map(_route_key))
+                  .groupby("route")["launch_cost"].sum())
+        mkt = base[new].assign(route=lambda d: d["sector"].map(_route_key)).groupby("route")["market"].first()
+        for route, g in n.groupby("route"):
+            flown = g[g["weekly_freq"] > 0]
+            launched = len(flown) > 0
+            contribution = float(g["contribution"].sum())
+            lc = float(launch.get(route, 0.0)) if launched else 0.0
+            rows.append({
+                "route": route, "market": mkt.get(route), "demand_scale": scale,
+                "decision": "LAUNCH" if launched else "NOT LAUNCHED",
+                "months_flown": int(flown["month"].nunique()),
+                "avg_weekly_when_flown": float(flown["weekly_freq"].mean()) if launched else 0.0,
+                "load_factor": float(flown["pax"].sum() / flown["seats"].sum()) if launched else np.nan,
+                "revenue": float(g["revenue"].sum()), "contribution": contribution,
+                "launch_cost": float(launch.get(route, 0.0)),
+                "first_year_net_after_launch": contribution - lc,
+                "network_net_profit": net,
+            })
+    long = pd.DataFrame(rows)
+    if long.empty:
+        return long, long
+
+    def verdict(g: pd.DataFrame) -> pd.Series:
+        g = g.sort_values("demand_scale")
+        launched = g["decision"].eq("LAUNCH").to_numpy()
+        scales = g["demand_scale"].to_numpy()
+        # Lowest scale from which the route is launched at every higher scale too.
+        need = next((scales[i] for i in range(len(scales)) if launched[i:].all()), None)
+        if launched.all():
+            v = f"ROBUST: launch even at x{scales[0]:g} demand"
+        elif need is None:
+            v = f"DON'T LAUNCH: not viable even at x{scales[-1]:g} demand"
+        else:
+            v = f"LAUNCH ONLY IF demand reaches x{need:g} of estimate"
+        out = {f"x{s:g}": d for s, d in zip(g["demand_scale"], g["decision"])}
+        out.update({f"net_x{s:g}": n for s, n in zip(g["demand_scale"], g["first_year_net_after_launch"])})
+        out["min_launch_scale"] = need
+        out["verdict"] = v
+        return pd.Series(out)
+
+    summary = long.groupby(["market", "route"]).apply(verdict, include_groups=False).reset_index()
+    return long, summary
+
+
 def run_scenarios(base, config, fleet, cons) -> tuple[pd.DataFrame, pd.DataFrame]:
     freqs, totals = {}, []
     for mult in config.atf_scenarios:
@@ -186,11 +260,7 @@ def run_scenarios(base, config, fleet, cons) -> tuple[pd.DataFrame, pd.DataFrame
         label = f"ATF x{mult:.2f}"
         freqs[label] = ch["weekly_freq"]
         tot = ch[["revenue", "total_cost", "contribution", "profit", "ask", "pax", "seats"]].sum()
-        cpd = base["new_cost_per_departure"] * (1 + base["fuel_share"] * (mult - 1))
-        fixed = ((1 - base["variable_cost_share"]) * cpd * base["ly_departures"]).sum()
-        launched = ch.loc[ch["weekly_freq"] > 0, ["sector", "launch_cost"]].drop_duplicates("sector")
-        tot["net_profit"] = tot["contribution"] - fixed - launched["launch_cost"].sum()
-        # Also: what if we flew the base-case plan but ATF moved?
+        tot["net_profit"] = _network_net_profit(ch, base, mult)
         totals.append({"scenario": label, "atf_multiplier": mult,
                        "sectors_months_operated": int((ch["weekly_freq"] > 0).sum()),
                        **tot.to_dict(),
@@ -242,6 +312,9 @@ def run(history, cost_forecast, fleet=None, constraints=None,
     }
     if base["is_new"].any():
         out["new_routes"] = new_route_summary(plan, config)
+        if scenarios and config.new_route_demand_scenarios:
+            out["new_route_scenarios"], out["new_route_scenario_summary"] = (
+                run_new_route_demand_scenarios(base, config, fleet_df, cons, chosen))
     if scenarios and config.atf_scenarios:
         out["atf_frequencies"], out["atf_summary"] = run_scenarios(base, config, fleet_df, cons)
     out["assumptions"] = pd.DataFrame(

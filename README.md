@@ -131,6 +131,14 @@ Then:
   months it flies without it, so aircraft moved onto the new route are charged
   at what they would have earned elsewhere. Launch cost is booked in the first
   month flown and deducted from net profit.
+* **Demand scenarios**: because the demand estimate is the weakest input, the
+  network is re-optimised with every new route's demand at
+  `new_route_demand_scenarios` (default ×0.6, ×0.8, ×1.0, ×1.2 of the estimate;
+  `--nr-demand 0.5,1,1.5` on the CLI, blank to switch off). Each route gets a
+  verdict: **ROBUST** (launched even at the lowest demand), **LAUNCH ONLY IF**
+  demand reaches ×k of the estimate, or **DON'T LAUNCH** (not viable even at the
+  highest). Results are in the `new_route_scenarios` and
+  `new_route_scenario_summary` sheets and in a chart in the New routes tab.
 * Outputs: a `new_routes` sheet and dashboard tab with the LAUNCH / NOT LAUNCHED
   decision, months flown, average frequency, LF, revenue, contribution and
   first-year result after launch cost. The plan shows `LAUNCH` actions.
@@ -153,6 +161,7 @@ Then:
 | `plan` | Per sector-month: action (ADD/CUT/MAINTAIN/DROP), weekly and daily frequency, pattern ("2x daily + 3/wk"), LF, fare, RASK/CASK, cost change, contribution and net profit uplift, break-even LF, spilled pax, **marginal value of ±1 weekly frequency**, `at_max_frequency` flag |
 | `fleet_utilisation` | Block hours available vs LY vs recommended |
 | `new_routes` | Launch decision and first-year economics per new sector (when a new-routes file is given) |
+| `new_route_scenarios`, `new_route_scenario_summary` | Launch decision, frequency and yr-1 result per new route at each demand scale, with a verdict |
 | `atf_frequencies`, `atf_summary` | Frequencies and network P&L under each ATF scenario, plus the robustness tag |
 | `assumptions` | Every parameter used |
 
@@ -171,11 +180,12 @@ Then:
 `market_fare_growth`, `frequency_elasticity`, `market_frequency_elasticity`,
 `fare_capacity_elasticity`, `demand_cv`, `variable_cost_share`, `fuel_share`,
 `min_weekly_if_operated`, `max_weekly_multiplier`, `pair_directions`,
+`new_route_ramp_months`, `new_route_ramp_start`, `new_route_demand_scenarios`,
 `min_fleet_utilisation`, `market_min_ask_share`, `atf_scenarios`.
 
 ## Limitations / next steps
-* New-route demand is only as good as your estimate or proxy. Run a range
-  (e.g. `demand_scale` 0.6 / 0.8 / 1.0) before committing.
+* New-route demand is only as good as your estimate or proxy. The demand-scale
+  scenarios show how wrong it can be before the decision flips.
 * Launch decisions are tested one route at a time (the worst one is dropped and
   the rest re-tested). This is exact for independent routes, but approximate
   when several new routes compete for the same aircraft.

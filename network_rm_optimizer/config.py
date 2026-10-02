@@ -67,6 +67,10 @@ class OptimizerConfig:
     # 100% after ramp_months (overridable per route in the new_routes file).
     new_route_ramp_months: int = 6
     new_route_ramp_start: float = 0.6
+    # Demand-scale scenarios for new routes: the network is re-optimised with
+    # every new route's demand x each factor (1.0 = the estimate as given), to
+    # show how much the launch decisions rely on the demand estimate.
+    new_route_demand_scenarios: tuple = (0.6, 0.8, 1.0, 1.2)
 
     # --- Network constraints ------------------------------------------------
     # Without a fleet file, block hours per fleet type per month are capped at

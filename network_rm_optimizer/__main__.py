@@ -52,6 +52,8 @@ def main(argv=None) -> int:
     o.add_argument("--min-fleet-utilisation", type=float)
     o.add_argument("--no-pairing", action="store_true", help="allow A-B and B-A to differ")
     o.add_argument("--atf", type=str, help="comma list of ATF multipliers, e.g. 0.9,1,1.2")
+    o.add_argument("--nr-demand", type=str,
+                   help="demand-scale scenarios for new routes, e.g. 0.6,0.8,1,1.2 (empty string = off)")
     o.add_argument("--no-scenarios", action="store_true")
     o.add_argument("--out", default="results/network_plan.xlsx")
 
@@ -77,8 +79,11 @@ def main(argv=None) -> int:
         overrides["pair_directions"] = False
     if a.atf:
         overrides["atf_scenarios"] = tuple(float(x) for x in a.atf.split(","))
-    if "atf_scenarios" in overrides:
-        overrides["atf_scenarios"] = tuple(overrides["atf_scenarios"])
+    if a.nr_demand is not None:
+        overrides["new_route_demand_scenarios"] = tuple(float(x) for x in a.nr_demand.split(",") if x.strip())
+    for k in ("atf_scenarios", "new_route_demand_scenarios"):
+        if k in overrides:
+            overrides[k] = tuple(overrides[k])
     cfg = OptimizerConfig(**overrides)
 
     res = run(a.history, a.costs, a.fleet, a.constraints, cfg, scenarios=not a.no_scenarios,
@@ -119,6 +124,11 @@ def main(argv=None) -> int:
               [["market", "sector", "decision", "start_month", "months_operated", "avg_weekly_when_flown",
                 "load_factor", "contribution_cr", "launch_cr", "net_after_launch_cr"]]
               .round(2).to_string(index=False))
+    if "new_route_scenario_summary" in res and len(res["new_route_scenario_summary"]):
+        ns = res["new_route_scenario_summary"]
+        print("\nNew-route demand scenarios (decision at each demand scale):")
+        print(ns[["market", "route"] + [c for c in ns.columns if c.startswith("x")] + ["verdict"]]
+              .to_string(index=False))
     sa = res["sector_annual"]
     print("\nSector plan (full-year average weekly frequency):")
     print(sa[["market", "sector", "ly_avg_weekly", "rec_avg_weekly", "months_operated"]]

@@ -89,3 +89,21 @@ def test_launch_decisions(sample):
     # Launch cost is deducted from network net profit.
     t = res["network_summary"].iloc[-1]
     assert t["rec_launch_cost"] == pytest.approx(1e7)
+
+
+def test_demand_scale_scenarios(sample):
+    cfg = OptimizerConfig(atf_scenarios=(), new_route_demand_scenarios=(0.3, 1.0, 1.5))
+    nr = pd.DataFrame([{"sector": "BLR-DXB", "distance_km": 2700, "proxy_sector": "BOM-DXB",
+                        "demand_scale": 0.8, "launch_cost": 1e7}])
+    res = run(sample["history"], sample["costs"], sample["fleet"], sample["constraints"], cfg,
+              scenarios=True, new_routes=nr)
+    long, summ = res["new_route_scenarios"], res["new_route_scenario_summary"]
+    assert sorted(long["demand_scale"]) == [0.3, 1.0, 1.5]
+    assert list(summ["route"]) == ["BLR-DXB"]  # reported once per city pair
+    # The x1.0 scenario is the base run.
+    base_launch = res["new_routes"]["decision"].eq("LAUNCH").any()
+    assert (long.loc[long["demand_scale"] == 1.0, "decision"].iloc[0] == "LAUNCH") == base_launch
+    # More demand never makes a route worth less.
+    net = long.sort_values("demand_scale")["first_year_net_after_launch"].to_numpy()
+    assert (np.diff(net) >= -1e-6).all()
+    assert summ["verdict"].iloc[0].startswith(("ROBUST", "LAUNCH ONLY IF", "DON'T LAUNCH"))
