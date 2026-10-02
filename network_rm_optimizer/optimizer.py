@@ -66,7 +66,9 @@ def _solve_block(opts: pd.DataFrame, base_b: pd.DataFrame, cap_b: pd.DataFrame,
     # by frequency-driven demand and by the leg's connecting seats.
     y = {}
     if od_b is not None and len(od_b):
-        leg_flows: dict[tuple, list] = {}
+        existing: dict[tuple, list] = {}
+        every: dict[tuple, list] = {}
+        has_new: set = set()
         for r in od_b.itertuples():
             if r.demand <= 0:
                 continue
@@ -76,10 +78,20 @@ def _solve_block(opts: pd.DataFrame, base_b: pd.DataFrame, cap_b: pd.DataFrame,
             for leg in r.leg_list:
                 lo = opts[(opts["sector"] == leg) & (opts["month"] == r.month)]
                 prob += v <= pulp.lpSum(r.demand * lo.at[i, "conn_mult"] * x[i] for i in lo.index)
-                leg_flows.setdefault((leg, r.month), []).append(v)
-        for (leg, m), vs in leg_flows.items():
+                every.setdefault((leg, r.month), []).append(v)
+                if r.is_new_od:
+                    has_new.add((leg, r.month))
+                else:
+                    existing.setdefault((leg, r.month), []).append(v)
+        for (leg, m), vs in existing.items():
+            # LY connecting traffic keeps its LY share of seats.
             lo = opts[(opts["sector"] == leg) & (opts["month"] == m)]
             prob += pulp.lpSum(vs) <= pulp.lpSum(lo.at[i, "conn_seats"] * x[i] for i in lo.index)
+        for key in has_new:
+            # New connections fill seats left empty: local + all connecting <= seats.
+            lo = opts[(opts["sector"] == key[0]) & (opts["month"] == key[1])]
+            prob += (pulp.lpSum(every[key])
+                     <= pulp.lpSum((lo.at[i, "seats"] - lo.at[i, "pax"]) * x[i] for i in lo.index))
     prob += pulp.lpSum(obj)
 
     for _, grp in opts.groupby(["sector", "month"]):

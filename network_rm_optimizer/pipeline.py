@@ -7,7 +7,7 @@ import pandas as pd
 from .config import OptimizerConfig
 from .data import load_constraints, load_fleet, prepare_costs, prepare_history, prepare_new_routes
 from .demand import calibrate, evaluate, frequency_options
-from .od import allocate_flows, load_od, od_demand, split_local
+from .od import allocate_flows, finalize_od, od_demand, parse_od, split_local
 from .optimizer import fleet_capacity, optimise_full
 
 METRICS = ["departures", "seats", "ask", "pax", "revenue", "variable_cost", "total_cost",
@@ -85,14 +85,16 @@ def summarise(plan: pd.DataFrame, by: list[str]) -> pd.DataFrame:
 
 def baseline_flows(od: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
     """O&D flows if last year's schedule is flown: demand, capped by connecting seats."""
-    lr = [(r.od_id, r.month, leg, r.demand) for r in od.itertuples() for leg in r.leg_list]
+    # Only last year's O&Ds fly in last year's schedule (new connections need new routes).
+    lr = [(r.od_id, r.month, leg, r.demand) for r in od.itertuples() if not r.is_new_od for leg in r.leg_list]
     lr = pd.DataFrame(lr, columns=["od_id", "month", "sector", "demand"])
     seats = base.assign(cs=base["ly_seats"] * (1 - base["local_seat_share"])).set_index(["sector", "month"])["cs"]
     tot = lr.groupby(["sector", "month"])["demand"].transform("sum")
     lr["ratio"] = seats.reindex(pd.MultiIndex.from_frame(lr[["sector", "month"]])).to_numpy() / tot.where(tot > 0)
     scale = lr.groupby("od_id")["ratio"].min().clip(upper=1.0)
-    return pd.DataFrame({"od_id": od["od_id"], "month": od["month"],
-                         "pax": od["demand"] * od["od_id"].map(scale).fillna(1.0), "fare": od["plan_fare"]})
+    pax = od["demand"] * od["od_id"].map(scale).fillna(1.0)
+    pax = pax.where(~od["is_new_od"].astype(bool), 0.0)  # new routes are not in last year's schedule
+    return pd.DataFrame({"od_id": od["od_id"], "month": od["month"], "pax": pax, "fare": od["plan_fare"]})
 
 
 def _add_connecting(plan: pd.DataFrame, prefix: str, alloc: pd.DataFrame | None) -> pd.DataFrame:
@@ -211,6 +213,7 @@ def new_route_summary(plan: pd.DataFrame, config: OptimizerConfig) -> pd.DataFra
         launch_cost=("launch_cost", "max"),
         rec_revenue=("rec_revenue", "sum"), rec_total_cost=("rec_total_cost", "sum"),
         rec_contribution=("rec_contribution", "sum"), rec_launch_cost=("rec_launch_cost", "sum"),
+        rec_conn_pax=("rec_conn_pax", "sum"), rec_beyond_revenue=("rec_beyond_revenue", "sum"),
         rec_pax=("rec_pax", "sum"), rec_seats=("rec_seats", "sum"),
     ).reset_index()
     avg = op.groupby("sector")["rec_weekly_freq"].mean()
@@ -218,9 +221,12 @@ def new_route_summary(plan: pd.DataFrame, config: OptimizerConfig) -> pd.DataFra
     g["decision"] = np.where(g["months_operated"] > 0, "LAUNCH", "NOT LAUNCHED")
     g["load_factor"] = np.where(g["rec_seats"] > 0, g["rec_pax"] / g["rec_seats"].where(g["rec_seats"] > 0), np.nan)
     g["first_year_net_after_launch"] = g["rec_contribution"] - g["rec_launch_cost"]
+    # Including revenue its connecting passengers bring on other legs.
+    g["network_net_after_launch"] = g["first_year_net_after_launch"] + g["rec_beyond_revenue"]
     return g[["market", "sector", "decision", "start_month", "months_operated", "avg_weekly_when_flown",
               "rec_revenue", "rec_total_cost", "rec_contribution", "launch_cost", "rec_launch_cost",
-              "first_year_net_after_launch", "load_factor", "rec_pax"]].sort_values(
+              "first_year_net_after_launch", "rec_conn_pax", "rec_beyond_revenue", "network_net_after_launch",
+              "load_factor", "rec_pax"]].sort_values(
         "first_year_net_after_launch", ascending=False)
 
 
@@ -244,27 +250,29 @@ def _network_net_profit(ch: pd.DataFrame, base: pd.DataFrame, cost_multiplier: f
 def od_summary(od: pd.DataFrame, flows: pd.DataFrame, base_fl: pd.DataFrame, plan: pd.DataFrame,
                config: OptimizerConfig) -> pd.DataFrame:
     """Per O&D-month: LY vs baseline vs recommended pax and revenue, and the limiting leg."""
-    w = plan.set_index(["sector", "month"])[["rec_weekly_freq", "ly_weekly_freq"]]
+    w = plan.set_index(["sector", "month"])[["rec_weekly_freq", "ref_weekly_freq"]]
     rows = []
     rec = flows.set_index("od_id")["pax"]
     bas = base_fl.set_index("od_id")["pax"]
     for r in od.itertuples():
-        mults = {leg: (w.at[(leg, r.month), "rec_weekly_freq"] / w.at[(leg, r.month), "ly_weekly_freq"])
+        mults = {leg: (w.at[(leg, r.month), "rec_weekly_freq"] / w.at[(leg, r.month), "ref_weekly_freq"])
                  ** config.connecting_frequency_elasticity for leg in r.leg_list}
         weakest = min(mults, key=mults.get)
         rp = float(rec.get(r.od_id, 0.0))
-        rows.append({"month": r.month, "od": r.od, "path": r.path, "ly_pax": r.pax, "ly_revenue": r.revenue,
+        rows.append({"month": r.month, "od": r.od, "path": r.path,
+                     "new_connection": bool(r.is_new_od), "ly_pax": r.pax, "ly_revenue": r.revenue,
                      "demand": r.demand, "base_pax": float(bas.get(r.od_id, 0.0)), "rec_pax": rp,
                      "fare": r.plan_fare, "rec_revenue": rp * r.plan_fare,
                      "lost_pax_vs_demand": r.demand - rp,
                      "weakest_leg": weakest if mults[weakest] < 0.999 else "",
                      "weakest_leg_freq_ratio": mults[weakest] ** (1 / config.connecting_frequency_elasticity)})
     m = pd.DataFrame(rows)
-    yr = m.groupby(["od", "path"], as_index=False)[["ly_pax", "ly_revenue", "demand", "base_pax", "rec_pax",
+    yr = m.groupby(["od", "path", "new_connection"], as_index=False)[["ly_pax", "ly_revenue", "demand", "base_pax", "rec_pax",
                                                      "rec_revenue", "lost_pax_vs_demand"]].sum()
     yr["month"] = "FULL YEAR"
     return pd.concat([yr, m], ignore_index=True)[
-        ["od", "path", "month", "ly_pax", "ly_revenue", "demand", "base_pax", "rec_pax", "rec_revenue",
+        ["od", "path", "new_connection", "month", "ly_pax", "ly_revenue", "demand", "base_pax", "rec_pax",
+         "rec_revenue",
          "fare", "lost_pax_vs_demand", "weakest_leg", "weakest_leg_freq_ratio"]]
 
 
@@ -283,7 +291,12 @@ def run_new_route_demand_scenarios(base, config, fleet, cons, chosen_base, od=No
         else:
             b = base.copy()
             b.loc[new, "ref_demand"] = b.loc[new, "ref_demand"] * scale
-            ch, fl = optimise_full(b, config, fleet, cons, od=od)
+            od_s = None
+            if od is not None:
+                od_s = od.copy()
+                nod = od_s["is_new_od"].astype(bool)
+                od_s.loc[nod, "demand"] = od_s.loc[nod, "demand"] * scale  # new connections scale too
+            ch, fl = optimise_full(b, config, fleet, cons, od=od_s)
         net = _network_net_profit(ch, base, flows=fl)
         n = ch[ch["is_new"]].assign(route=lambda d: d["sector"].map(_route_key))
         launch = (base[new].drop_duplicates("sector").assign(route=lambda d: d["sector"].map(_route_key))
@@ -370,11 +383,16 @@ def run(history, cost_forecast, fleet=None, constraints=None,
     config.validate()
     fleet_df = load_fleet(fleet)
     base = prepare_history(history, config, fleet_df)
-    od_raw = load_od(od, base, config) if od is not None else None
-    base = calibrate(split_local(base, od_raw), config)
+    od_parsed = parse_od(od) if od is not None else None
+    # LY connecting traffic (all legs flown last year) splits local vs connecting.
+    od_ly = (finalize_od(od_parsed, base.assign(ramp=1.0), config, skip_unknown=True)
+             if od_parsed is not None else None)
+    base = calibrate(split_local(base, od_ly), config)
     if new_routes is not None:
         nr = prepare_new_routes(new_routes, base, config, fleet_df)
         base = calibrate(pd.concat([base, nr], ignore_index=True), config)
+    # All O&Ds, including new connections over new routes.
+    od_raw = finalize_od(od_parsed, base, config) if od_parsed is not None else None
     base = prepare_costs(cost_forecast, base, config)
     cons = load_constraints(constraints)
     od_d = od_demand(od_raw, base, config) if od_raw is not None else None

@@ -73,7 +73,7 @@ write_excel(res, "network_plan.xlsx")
 | **cost_forecast** (new year) | `month`, `sector`, and one of `cost_per_departure` / `cask` / `total_cost` + `planned_departures` | `fuel_share`, `variable_cost_share` per sector |
 | **fleet** | `fleet_type`, `aircraft`, `block_hours_per_day` | `seats` |
 | **constraints** | `sector` | `month`, `min_weekly`, `max_weekly`, `fixed_weekly`, `must_operate` |
-| **od** (connecting traffic LY, one row per itinerary per month) | `month`, `legs` (`DXB-BOM;BOM-BLR` in travel order, or `leg1`, `leg2`, …), `pax`, `revenue` (total itinerary revenue) or `avg_fare` | `od` (label) |
+| **od** (connecting traffic LY, one row per itinerary per month) | `month`, `legs` (`DXB-BOM;BOM-BLR` in travel order, or `leg1`, `leg2`, …), `pax`, `revenue` (total itinerary revenue) or `avg_fare` | `od` (label); for new connections over new routes: estimated `pax`, or `est_daily_pax` + `avg_fare` with `month` blank |
 | **new_routes** (routes not flown LY) | `sector` (or `origin`+`destination`), `distance_km`, and either `est_daily_pax` + `est_avg_fare` **or** `proxy_sector` | `market`, `fleet_type`, `seats_per_flight`, `block_hours`, `ref_weekly` (7), `demand_scale`, `fare_scale`, `start_month`, `ramp_months`, `ramp_start`, `launch_cost`, `max_weekly`, `both_directions` (1) |
 
 Without a fleet file, each month may use at most last year's block hours
@@ -131,6 +131,25 @@ revenue on the Gulf leg. With the `od` file:
   revenue, i.e. what the network loses if the sector is cut. Results are in
   the `od_flows` sheet (per O&D: LY vs recommended pax and revenue, and the
   weakest leg holding it back) and the **Connections** dashboard tab.
+
+**New connections over new routes.** Add O&D rows whose legs include a new
+route (from the new-routes file), e.g. `HYD-BLR;BLR-DXB` once BLR-DXB is a
+candidate. Give an *estimate*: `pax` + `revenue`/`avg_fare` per month, or
+`est_daily_pax` + `avg_fare` with `month` blank for all year. The estimate is
+mature demand at the new route's reference frequency (no growth applied). New
+connections:
+* ramp up with the new route and start when it starts,
+* fill seats local traffic leaves empty on every leg (local + all connecting
+  pax ≤ seats), while last year's connections keep their LY seat share,
+* count toward the launch test, so a route that doesn't pay on its own traffic
+  can be launched for the connections it creates,
+* scale with the new-route demand scenarios,
+* don't fly in the "LY schedule at new cost" baseline.
+
+The new-routes summary adds `rec_beyond_revenue` (revenue its connecting
+passengers bring on other legs) and `network_net_after_launch`. O&D rows
+whose legs are neither flown last year nor in the new-routes file are skipped
+with a warning, so one O&D file works with or without new routes.
 
 On the sample network, the local-only plan is worth ₹81.9 Cr net profit once
 the connections it breaks are counted (it claimed ₹115 Cr). The
@@ -226,8 +245,11 @@ Then:
 * O&D effects need the O&D file. The split of seats between local and
   connecting traffic is fixed at last year's mix (no re-optimisation of RM
   controls between the two). Connecting pax who lose their connection are
-  assumed lost (no recapture on another path). New routes don't create new
-  connections yet.
+  assumed lost (no recapture on another path). A new nonstop doesn't take
+  traffic from existing connections on the same O&D (e.g. BLR-DXB nonstop vs
+  BLR-BOM-DXB): reduce those O&Ds' pax yourself if you expect that.
+  O&D "demand" is stated at the reference frequency, so flows can exceed it
+  when legs fly more often than that.
 * The ±1/wk marginal columns value local traffic only; connecting effects of a
   frequency change are in the optimiser's choice, not in those columns.
 * No competitor response beyond what the elasticities capture.

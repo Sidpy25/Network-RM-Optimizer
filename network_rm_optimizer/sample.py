@@ -108,6 +108,12 @@ def generate(out_dir: str, ly_year: int = 2025, seed: int = 7) -> dict[str, str]
             pax = share * min(lp.at[(leg, m), "pax"] for leg in legs)
             fare = disc * sum(lp.at[(leg, m), "fare"] for leg in legs)
             od_rows.append({"month": m, "legs": ";".join(legs), "pax": round(pax), "revenue": round(pax * fare)})
+    # New connections over the candidate new routes: estimates, month blank = all year.
+    for legs, daily, fare in [
+        (("HYD-BLR", "BLR-DXB"), 30, 16000), (("DXB-BLR", "BLR-HYD"), 30, 15500),
+        (("BOM-DEL", "DEL-IXB"), 35, 8800), (("IXB-DEL", "DEL-BOM"), 35, 8800),
+    ]:
+        od_rows.append({"month": None, "legs": ";".join(legs), "est_daily_pax": daily, "avg_fare": fare})
     os.makedirs(out_dir, exist_ok=True)
     paths = {
         "history": os.path.join(out_dir, "history_ly.csv"),

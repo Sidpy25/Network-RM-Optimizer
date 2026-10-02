@@ -73,10 +73,60 @@ def test_od_validation(sample):
     with pytest.raises(ValueError, match="do not connect"):
         load_od(pd.DataFrame([{"month": 1, "legs": "DXB-BOM;DEL-BLR", "pax": 10, "revenue": 1000}]),
                 base, OptimizerConfig())
-    with pytest.raises(ValueError, match="not found"):
-        load_od(pd.DataFrame([{"month": 1, "legs": "DXB-BOM;BOM-XXX", "pax": 10, "revenue": 1000}]),
-                base, OptimizerConfig())
+    with pytest.warns(UserWarning, match="Skipped O&Ds"):
+        out = load_od(pd.DataFrame([{"month": 1, "legs": "DXB-BOM;BOM-XXX", "pax": 10, "revenue": 1000}]),
+                      base, OptimizerConfig())
+    assert out.empty
     od = load_od(pd.DataFrame([{"month": "2025-01", "leg1": "dxb-bom", "leg2": "BOM-BLR", "pax": 10,
                                 "avg_fare": 100}]), base, OptimizerConfig())
     assert od.loc[0, "od"] == "DXB-BLR" and od.loc[0, "revenue"] == 1000
     assert sum(od.loc[0, "shares"]) == pytest.approx(1.0)
+
+
+# ---- new connections over new routes ----------------------------------------
+
+def _new_route_kw(sample):
+    return dict(history=sample["history"], cost_forecast=sample["costs"], fleet=sample["fleet"],
+                constraints=sample["constraints"], scenarios=False)
+
+
+HYD_GOI = pd.DataFrame([{"sector": "HYD-GOI", "market": "Leisure", "distance_km": 580, "block_hours": 1.3,
+                         "proxy_sector": "BOM-GOI", "demand_scale": 0.2, "launch_cost": 3.0e7}])
+
+
+def test_new_connection_rows_and_baseline(sample):
+    res = run(**_new_route_kw(sample), new_routes=sample["new_routes"], od=sample["od"])
+    o = res["od_flows"]
+    new = o[o["new_connection"] & (o["month"] != "FULL YEAR")]
+    assert set(new["od"]) == {"HYD-DXB", "DXB-HYD", "BOM-IXB", "IXB-BOM"}
+    assert (new["ly_pax"] == 0).all() and (new["base_pax"] == 0).all()
+    # BLR-DXB starts in April: no HYD-DXB traffic before that.
+    hyd_dxb = new[new["od"] == "HYD-DXB"].set_index("month")
+    assert (hyd_dxb.loc[[1, 2, 3], "rec_pax"] == 0).all()
+    assert hyd_dxb["rec_pax"].sum() > 0
+    # Ramp-up: launch-month demand is below mature demand.
+    assert hyd_dxb.loc[4, "demand"] < hyd_dxb.loc[12, "demand"]
+    # Last year's schedule is unaffected by new connections.
+    sa = res["sector_annual"]
+    assert np.allclose(sa["base_revenue"], sa["ly_revenue"], rtol=1e-6)
+
+
+def test_new_connection_can_justify_a_launch(sample):
+    kw = _new_route_kw(sample)
+    alone = run(**kw, new_routes=HYD_GOI, od=sample["od"])
+    assert (alone["new_routes"]["decision"] == "NOT LAUNCHED").all()
+    feed = pd.DataFrame([{"legs": "BLR-HYD;HYD-GOI", "est_daily_pax": 150, "avg_fare": 9000},
+                         {"legs": "GOI-HYD;HYD-BLR", "est_daily_pax": 150, "avg_fare": 9000}])
+    od = pd.concat([pd.read_csv(sample["od"]), feed], ignore_index=True)
+    fed = run(**kw, new_routes=HYD_GOI, od=od)
+    assert (fed["new_routes"]["decision"] == "LAUNCH").all()
+    assert fed["new_routes"]["rec_beyond_revenue"].sum() > 0
+
+
+def test_new_connection_needs_its_new_route(sample):
+    nr = pd.read_csv(sample["new_routes"])
+    nr.loc[nr["sector"] == "BLR-DXB", "launch_cost"] = 5e10  # never worth launching
+    res = run(**_new_route_kw(sample), new_routes=nr, od=sample["od"])
+    o = res["od_flows"]
+    via = o[(o["month"] != "FULL YEAR") & o["path"].str.contains("BLR-DXB|DXB-BLR")]
+    assert len(via) and (via["rec_pax"] < 1e-6).all()

@@ -81,7 +81,9 @@ else:
              "or a proxy_sector to borrow demand/fare/seasonality from. See the template."))
     od = read_upload(st.sidebar.file_uploader(
         "Connecting O&D traffic LY (optional)", ["csv", "xlsx"],
-        help="One row per connecting itinerary per month: month, legs ('DXB-BOM;BOM-BLR'), pax, revenue."))
+        help="One row per connecting itinerary per month: month, legs ('DXB-BOM;BOM-BLR'), pax, revenue. "
+             "Itineraries using a new route are new connections: give estimated pax + avg_fare, "
+             "or est_daily_pax + avg_fare with month blank for all year."))
     with st.sidebar.expander("Download input templates"):
         for k, df in sample_frames().items():
             st.download_button(f"{k}.csv", df.to_csv(index=False), f"{k}_template.csv", "text/csv",
@@ -456,14 +458,16 @@ with tabs[4]:
         yr = odf[odf["month"] == "FULL YEAR"].copy()
         for c in ["ly_revenue", "rec_revenue"]:
             yr[c] = yr[c] / 1e7
-        st.dataframe(yr[["od", "path", "ly_pax", "demand", "base_pax", "rec_pax", "lost_pax_vs_demand",
-                         "ly_revenue", "rec_revenue"]], hide_index=True, width="stretch", column_config={
-            "od": "O&D", "path": "Path",
+        yr["new_connection"] = yr["new_connection"].map({True: "🆕 via new route", False: ""})
+        st.dataframe(yr.sort_values(["new_connection", "rec_revenue"], ascending=[False, False])[
+            ["od", "path", "new_connection", "ly_pax", "demand", "base_pax", "rec_pax", "lost_pax_vs_demand",
+             "ly_revenue", "rec_revenue"]], hide_index=True, width="stretch", column_config={
+            "od": "O&D", "path": "Path", "new_connection": "New?",
             "ly_pax": st.column_config.NumberColumn("LY pax", format="%.0f"),
-            "demand": st.column_config.NumberColumn("Demand", format="%.0f"),
+            "demand": st.column_config.NumberColumn("Demand @ ref. frequency", format="%.0f"),
             "base_pax": st.column_config.NumberColumn("Pax @ LY schedule", format="%.0f"),
             "rec_pax": st.column_config.NumberColumn("Pax @ recommended", format="%.0f"),
-            "lost_pax_vs_demand": st.column_config.NumberColumn("Lost vs demand", format="%.0f"),
+            "lost_pax_vs_demand": st.column_config.NumberColumn("Below demand (− = above)", format="%.0f"),
             "ly_revenue": st.column_config.NumberColumn("LY ₹Cr", format="%.1f"),
             "rec_revenue": st.column_config.NumberColumn("Recommended ₹Cr", format="%.1f")})
         with st.expander("By month (with the weakest leg holding each O&D back)"):
@@ -480,12 +484,14 @@ with tabs[5]:
     else:
         st.subheader("Should we launch these routes?")
         st.caption("A route is launched only if the extra network contribution it earns (after the "
-                   "aircraft time it takes from other routes) covers its one-off launch cost. Demand ramps up "
-                   "over the first months. Launch cost sits on the listed direction.")
+                   "aircraft time it takes from other routes, and including new connections it creates) covers "
+                   "its one-off launch cost. Demand ramps up over the first months. Launch cost sits on the "
+                   "listed direction.")
         v = nrs.copy()
         v["decision"] = v["decision"].map({"LAUNCH": "✅ LAUNCH", "NOT LAUNCHED": "⛔ NOT LAUNCHED"})
         v["start_month"] = v["start_month"].map(lambda m: MONTHS[int(m) - 1])
-        for c in ["rec_revenue", "rec_total_cost", "rec_contribution", "launch_cost", "first_year_net_after_launch"]:
+        for c in ["rec_revenue", "rec_total_cost", "rec_contribution", "launch_cost", "first_year_net_after_launch",
+                  "rec_beyond_revenue", "network_net_after_launch"]:
             v[c] = v[c] / 1e7
         st.dataframe(v.drop(columns=["rec_launch_cost", "rec_pax"]), hide_index=True, width="stretch",
                      column_config={
@@ -498,6 +504,11 @@ with tabs[5]:
                          "launch_cost": st.column_config.NumberColumn("Launch cost ₹Cr", format="%.2f"),
                          "first_year_net_after_launch": st.column_config.NumberColumn(
                              "Yr-1 contribution after launch ₹Cr", format="%.2f"),
+                         "rec_conn_pax": st.column_config.NumberColumn("Connecting pax", format="%.0f"),
+                         "rec_beyond_revenue": st.column_config.NumberColumn("Beyond revenue fed ₹Cr",
+                                                                             format="%.2f"),
+                         "network_net_after_launch": st.column_config.NumberColumn(
+                             "Network value after launch ₹Cr", format="%.2f"),
                          "load_factor": st.column_config.NumberColumn("LF", format="percent")})
         ns, nl = res.get("new_route_scenario_summary"), res.get("new_route_scenarios")
         if ns is not None and not ns.empty:

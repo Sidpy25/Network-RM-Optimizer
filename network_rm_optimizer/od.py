@@ -21,6 +21,10 @@ Model:
     fewer frequencies mean fewer connection options. Connecting pax also need
     seats: the flows on a leg cannot exceed its connecting share of seats.
   * At last year's schedule local + connecting revenue reproduces LY revenue.
+  * New connections: O&D rows that use a new route carry an *estimate* of
+    demand (at the new route's reference frequency) instead of LY pax. They
+    ramp up with the new route and fill seats local traffic leaves empty on
+    every leg, so they add to the new route's launch case.
 """
 from __future__ import annotations
 
@@ -30,15 +34,15 @@ import numpy as np
 import pandas as pd
 
 from .config import OptimizerConfig
-from .data import _parse_month, _read
+from .data import _parse_month, _read, days_in_month
 
 
 def _norm_leg(x: str) -> str:
     return x.strip().upper().replace(" ", "").replace("/", "-")
 
 
-def load_od(path_or_df, base: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
-    """Parse and validate the O&D file. Returns one row per O&D-month."""
+def parse_od(path_or_df) -> pd.DataFrame:
+    """Read the O&D file and normalise legs (no validation against sectors yet)."""
     od = _read(path_or_df)
     if "legs" not in od.columns:
         leg_cols = sorted(c for c in od.columns if c.startswith("leg") and c[3:].isdigit())
@@ -46,10 +50,8 @@ def load_od(path_or_df, base: pd.DataFrame, config: OptimizerConfig) -> pd.DataF
             raise ValueError("od file needs a 'legs' column ('DXB-BOM;BOM-BLR') or leg1, leg2, ... columns")
         od["legs"] = od[leg_cols].apply(lambda r: ";".join(str(v) for v in r if pd.notna(v) and str(v).strip()),
                                         axis=1)
-    for c in ("month", "pax"):
-        if c not in od.columns:
-            raise ValueError(f"od file is missing required column '{c}'")
-    od["month"] = _parse_month(od["month"])
+    if "month" not in od.columns:
+        od["month"] = np.nan
     od["leg_list"] = od["legs"].astype(str).map(lambda s: [_norm_leg(x) for x in s.replace(",", ";").split(";")
                                                          if x.strip()])
     bad = od[od["leg_list"].map(len) < 2]
@@ -63,29 +65,82 @@ def load_od(path_or_df, base: pd.DataFrame, config: OptimizerConfig) -> pd.DataF
         od["od"] = od["leg_list"].map(lambda L: f"{L[0].split('-')[0]}-{L[-1].split('-')[-1]}")
     od["od"] = od["od"].astype(str).str.upper()
     od["path"] = od["leg_list"].map(lambda L: " > ".join(L))
+    return od
 
-    known = set(base.loc[~base["is_new"].astype(bool), "sector"])
-    missing = sorted({leg for L in od["leg_list"] for leg in L} - known)
-    if missing:
-        raise ValueError(f"O&D legs not found among last year's sectors: {missing}")
 
+def finalize_od(od: pd.DataFrame, base: pd.DataFrame, config: OptimizerConfig,
+                skip_unknown: bool = False) -> pd.DataFrame:
+    """Validate legs against `base` and build one row per O&D-month.
+
+    O&Ds whose legs are all flown last year carry LY pax/revenue. O&Ds using a
+    new route are NEW connections: their pax/revenue (or est_daily_pax +
+    avg_fare, month blank = every month) are the estimate of mature monthly
+    demand at the new route's reference frequency; LY pax is zero.
+    """
+    od = od.copy()
+    known = set(base["sector"])
+    new_sectors = set(base.loc[base["is_new"].astype(bool), "sector"])
+    unknown = od["leg_list"].map(lambda L: not set(L) <= known)
+    if unknown.any():
+        if not skip_unknown:
+            missing = sorted({leg for L in od.loc[unknown, "leg_list"] for leg in L} - known)
+            warnings.warn(f"Skipped O&Ds using legs that are neither flown last year nor in the new routes "
+                          f"file: {missing}")
+        od = od[~unknown]
+    od["is_new_od"] = od["leg_list"].map(lambda L: bool(set(L) & new_sectors))
+
+    # Rows without a month: expand an est_daily_pax estimate to every month.
+    month_blank = od["month"].isna() | (od["month"].astype(str).str.strip().isin(["", "nan", "ALL", "all"]))
+    if month_blank.any():
+        if "est_daily_pax" not in od.columns:
+            raise ValueError("O&D rows without a month need est_daily_pax")
+        exp = []
+        for _, r in od[month_blank].iterrows():
+            for m in range(1, 13):
+                days = days_in_month(config.target_year, m)
+                exp.append({**r.to_dict(), "month": m, "pax": float(r["est_daily_pax"]) * days})
+        od = pd.concat([od[~month_blank], pd.DataFrame(exp)], ignore_index=True)
+    if len(od) == 0:
+        return pd.DataFrame(columns=["od_id", "month", "od", "path", "leg_list", "shares", "is_new_od", "pax",
+                                     "revenue", "fare", "est_pax", "ramp"])
+    od["month"] = _parse_month(od["month"])
+    if "pax" not in od.columns:
+        raise ValueError("od file is missing required column 'pax'")
     od["pax"] = od["pax"].astype(float)
-    if "revenue" in od.columns:
+    if "revenue" in od.columns and od["revenue"].notna().all():
         od["revenue"] = od["revenue"].astype(float)
     elif "avg_fare" in od.columns:
-        od["revenue"] = od["pax"] * od["avg_fare"].astype(float)
+        rev = od["revenue"].astype(float) if "revenue" in od.columns else pd.Series(np.nan, index=od.index)
+        od["revenue"] = rev.fillna(od["pax"] * od["avg_fare"].astype(float))
     else:
         raise ValueError("od file needs 'revenue' or 'avg_fare'")
+    if od["revenue"].isna().any():
+        raise ValueError("od rows missing revenue/avg_fare: " + ", ".join(od.loc[od["revenue"].isna(), "path"][:3]))
     od["fare"] = od["revenue"] / od["pax"].where(od["pax"] > 0)
 
     dist = base.drop_duplicates("sector").set_index("sector")["distance_km"]
     od["shares"] = od["leg_list"].map(lambda L: [dist[x] / sum(dist[y] for y in L) for x in L])
-
     if od.duplicated(["path", "month"]).any():
         raise ValueError("Duplicate O&D path-month rows in od file")
+
+    # New connections: estimate goes to est_pax; LY actuals are zero.
+    od["est_pax"] = np.where(od["is_new_od"], od["pax"], np.nan)
+    od.loc[od["is_new_od"], ["pax", "revenue"]] = 0.0
+    ramp = base.set_index(["sector", "month"])["ramp"]
+    od["ramp"] = [min((ramp[(leg, m)] for leg in L if leg in new_sectors), default=1.0)
+                  for L, m in zip(od["leg_list"], od["month"])]
     od = od.reset_index(drop=True)
     od["od_id"] = od.index
-    return od[["od_id", "month", "od", "path", "leg_list", "shares", "pax", "revenue", "fare"]]
+    return od[["od_id", "month", "od", "path", "leg_list", "shares", "is_new_od", "pax", "revenue", "fare",
+               "est_pax", "ramp"]]
+
+
+def load_od(path_or_df, base: pd.DataFrame, config: OptimizerConfig) -> pd.DataFrame:
+    """Parse and validate the O&D file against `base`."""
+    b = base if "is_new" in base.columns else base.assign(is_new=False)
+    if "ramp" not in b.columns:
+        b = b.assign(ramp=1.0)
+    return finalize_od(parse_od(path_or_df), b, config)
 
 
 def leg_rows(od: pd.DataFrame) -> pd.DataFrame:
@@ -101,6 +156,7 @@ def split_local(base: pd.DataFrame, od: pd.DataFrame | None) -> pd.DataFrame:
     b["ly_conn_pax"] = 0.0
     b["ly_conn_revenue"] = 0.0
     if od is not None and len(od):
+        od = od[~od["is_new_od"]] if "is_new_od" in od.columns else od
         lr = leg_rows(od).merge(od[["od_id", "pax", "revenue"]], on="od_id")
         lr["conn_rev"] = lr["revenue"] * lr["share"]
         agg = lr.groupby(["sector", "month"]).agg(c_pax=("pax", "sum"), c_rev=("conn_rev", "sum"))
@@ -122,15 +178,22 @@ def split_local(base: pd.DataFrame, od: pd.DataFrame | None) -> pd.DataFrame:
     return b
 
 
-def od_demand(od: pd.DataFrame, base: pd.DataFrame, config: OptimizerConfig, scale: float = 1.0) -> pd.DataFrame:
-    """Planning-year O&D demand and fare (growth from the first leg's market)."""
+def od_demand(od: pd.DataFrame, base: pd.DataFrame, config: OptimizerConfig,
+              new_scale: float = 1.0) -> pd.DataFrame:
+    """Planning-year O&D demand and fare.
+
+    Existing O&Ds: LY pax x growth (first leg's market). New connections: the
+    estimate x the new route's ramp-up x new_scale (no growth - the estimate is
+    already in planning-year terms).
+    """
     d = od.copy()
     mkt = base.drop_duplicates("sector").set_index("sector")["market"]
     first_mkt = d["leg_list"].map(lambda L: mkt[L[0]])
     g = first_mkt.map(config.market_demand_growth).fillna(config.demand_growth)
     fg = first_mkt.map(config.market_fare_growth).fillna(config.fare_growth)
-    d["demand"] = d["pax"] * (1 + g) * scale
-    d["plan_fare"] = d["fare"].fillna(0.0) * (1 + fg)
+    new = d["is_new_od"].astype(bool)
+    d["demand"] = np.where(new, d["est_pax"].fillna(0.0) * d["ramp"] * new_scale, d["pax"] * (1 + g))
+    d["plan_fare"] = np.where(new, d["fare"].fillna(0.0), d["fare"].fillna(0.0) * (1 + fg))
     return d
 
 
